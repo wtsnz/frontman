@@ -8,7 +8,7 @@ defmodule Frontman.MixProject do
       elixir: "~> 1.20",
       source_url: "https://github.com/wtsnz/frontman",
       package: [
-        files: ~w(lib mix.exs .formatter.exs README.md CHANGELOG.md LICENSE),
+        files: ~w(lib docs mix.exs .formatter.exs README.md CHANGELOG.md LICENSE),
         licenses: ["MIT"],
         links: %{"GitHub" => "https://github.com/wtsnz/frontman"}
       ],
