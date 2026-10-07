@@ -57,16 +57,21 @@ defmodule Frontman.Proxy do
         result =
           try do
             case read_full_body(conn, []) do
-              {:ok, body, conn} -> {:response, attempt(conn, worker, body), body}
-              :too_large -> :too_large
+              {:ok, body, conn} -> {:response, attempt(conn, worker, body), conn, body}
+              {:too_large, conn} -> {:too_large, conn}
             end
           after
             Frontend.checkin(worker)
           end
 
+        # Answer on the conn that read the body. The adapter tracks the body on it; the earlier
+        # one would leave the body unread and corrupt the next request on the connection.
         case result do
-          {:response, response, body} -> finish(response, conn, body, [worker.pid])
-          :too_large -> send_resp(conn, 413, "")
+          {:response, response, conn, body} ->
+            finish(response, conn, body, [worker.pid])
+
+          {:too_large, conn} ->
+            conn |> put_resp_header("connection", "close") |> send_resp(413, "")
         end
     end
   end
@@ -78,17 +83,20 @@ defmodule Frontman.Proxy do
     case read_body(conn, length: @max_body) do
       {:ok, chunk, conn} -> finish_body(conn, [chunks, chunk])
       {:more, chunk, conn} -> read_more(conn, [chunks, chunk])
-      {:error, _reason} -> :too_large
+      # The body is left part-read, so the 413 closes the connection.
+      {:error, _reason} -> {:too_large, conn}
     end
   end
 
   defp read_more(conn, chunks) do
-    if IO.iodata_length(chunks) > @max_body, do: :too_large, else: read_full_body(conn, chunks)
+    if IO.iodata_length(chunks) > @max_body,
+      do: {:too_large, conn},
+      else: read_full_body(conn, chunks)
   end
 
   defp finish_body(conn, chunks) do
     if IO.iodata_length(chunks) > @max_body,
-      do: :too_large,
+      do: {:too_large, conn},
       else: {:ok, IO.iodata_to_binary(chunks), conn}
   end
 

@@ -6,6 +6,11 @@ defmodule Frontman.ProxyTest do
   alias Frontman, as: Frontend
   alias Frontman.Proxy
 
+  defmodule Gateway do
+    def init(opts), do: Frontman.Proxy.init(opts)
+    def call(conn, opts), do: Frontman.Proxy.call(conn, opts)
+  end
+
   defmodule Upstream do
     import Plug.Conn
 
@@ -193,6 +198,37 @@ defmodule Frontman.ProxyTest do
     Frontend.checkin(live)
   end
 
+  test "a retried request with a body leaves the connection ready for the next one", %{
+    port: port
+  } do
+    register_worker(1, port)
+    {:ok, live} = Frontend.checkout(TestPool)
+    register_worker(2, closed_port())
+
+    gateway =
+      start_supervised!(
+        {Bandit, plug: {Gateway, [name: TestPool]}, port: 0, ip: :loopback, startup_log: false},
+        id: :gateway
+      )
+
+    {:ok, {_ip, gateway_port}} = ThousandIsland.listener_info(gateway)
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, gateway_port, [:binary, active: false])
+
+    # The body follows Bandit's 100 Continue, so it's still unread when the proxy reads it.
+    :ok =
+      :gen_tcp.send(
+        socket,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\n"
+      )
+
+    assert {:ok, "HTTP/1.1 100 Continue" <> _} = :gen_tcp.recv(socket, 0, 2_000)
+    :ok = :gen_tcp.send(socket, "abc")
+    assert receive_response(socket) =~ ~r/\AHTTP\/1.1 201/
+    :ok = :gen_tcp.send(socket, "GET /echo HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert receive_response(socket) =~ ~r/\AHTTP\/1.1 201/
+    Frontend.checkin(live)
+  end
+
   test "checks out the least busy worker and checks it back in", %{port: port} do
     register_worker(1, port)
     {:ok, busy} = Frontend.checkout(TestPool)
@@ -220,6 +256,18 @@ defmodule Frontman.ProxyTest do
     })
 
     worker
+  end
+
+  # Reads one chunked response off a keep-alive socket.
+  defp receive_response(socket, acc \\ "") do
+    if String.ends_with?(acc, "\r\n0\r\n\r\n") or acc =~ ~r/connection: close/i do
+      acc
+    else
+      case :gen_tcp.recv(socket, 0, 2_000) do
+        {:ok, data} -> receive_response(socket, acc <> data)
+        {:error, _reason} -> acc
+      end
+    end
   end
 
   defp closed_port do
