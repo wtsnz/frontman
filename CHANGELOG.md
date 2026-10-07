@@ -12,3 +12,5 @@ Initial extraction from a Phoenix, Ash and TanStack Start application. Experimen
 - Guides in `docs/`: purpose, setup with Phoenix, Ash and TanStack Start, internals, operations and reference.
 - Setup examples for shared SSR/browser loaders, the trusted public origin and the tested Nitro build.
 - Context and results for the catalogue's deployed navigation CPU measurement.
+- `port` pool option: proxy to a server Frontman doesn't run, such as the Vite dev server.
+- The proxy sets `X-Forwarded-Host` from the `Host` header, keeping a non-default port.

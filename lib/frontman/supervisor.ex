@@ -9,13 +9,7 @@ defmodule Frontman.Supervisor do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    count = Keyword.get(opts, :workers, 1)
-
-    unless is_atom(name) and is_integer(count) and count > 0 do
-      raise ArgumentError, "name must be an atom and workers must be a positive integer"
-    end
-
-    for key <- [:executable, :args, :directory], do: Keyword.fetch!(opts, key)
+    unless is_atom(name), do: raise(ArgumentError, "name must be an atom")
 
     children = [
       {Registry, keys: :duplicate, name: Frontman.registry(name)},
@@ -24,12 +18,36 @@ defmodule Frontman.Supervisor do
       {Finch, name: Frontman.health_finch(name), pools: %{default: [size: 1]}},
       {Task.Supervisor, name: Frontman.tasks(name)},
       {Frontman.Admission, opts},
-      {Frontman.PoolSupervisor, Keyword.put(opts, :workers, count)}
+      workers(opts)
     ]
 
     # Rebuild workers if their registry or HTTP client is lost. Individual worker crashes
     # remain isolated inside PoolSupervisor.
     Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  # With `port`, the server runs outside Frontman and only its address is registered.
+  defp workers(opts) do
+    case Keyword.fetch(opts, :port) do
+      {:ok, port} ->
+        unless is_integer(port) and port in 1..65_535,
+          do: raise(ArgumentError, "port must be an integer from 1 to 65535")
+
+        for key <- [:executable, :args, :directory, :workers], Keyword.has_key?(opts, key) do
+          raise ArgumentError, "#{key} can't be combined with port"
+        end
+
+        {Frontman.External, opts}
+
+      :error ->
+        count = Keyword.get(opts, :workers, 1)
+
+        unless is_integer(count) and count > 0,
+          do: raise(ArgumentError, "workers must be a positive integer")
+
+        for key <- [:executable, :args, :directory], do: Keyword.fetch!(opts, key)
+        {Frontman.PoolSupervisor, Keyword.put(opts, :workers, count)}
+    end
   end
 end
 

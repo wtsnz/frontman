@@ -10,6 +10,7 @@ Pass these to `{Frontman, opts}` or `Frontman.start_link/1`.
 | `executable` | required | Absolute path to the program, usually `node`. Run directly, without a shell. |
 | `args` | required | Arguments, for example `[".output/server/index.mjs"]`. |
 | `directory` | required | Working directory for the process. |
+| `port` | | Loopback port of a server you run yourself, such as the Vite dev server. Replaces `executable`, `args`, `directory` and `workers`; see [External server](#external-server). |
 | `workers` | `1` | Number of Node processes. Positive integer. |
 | `max_concurrency` | `16` | Requests in flight per worker before admission rejects. Positive integer. |
 | `env` | `[]` | Extra environment as `{"KEY", "value"}` string pairs. Added to the BEAM's environment. |
@@ -23,6 +24,17 @@ Pass these to `{Frontman, opts}` or `Frontman.start_link/1`.
 
 All timing options must be positive integers, and `restart_backoff_min` can't exceed
 `restart_backoff_max`. Bad values raise `ArgumentError` at start.
+
+### External server
+
+With `port`, Frontman starts no process. It registers `127.0.0.1:<port>` as worker 1 and sends
+requests there through the same admission and proxy. It never probes or restarts that server, so
+the worker is always listed as ready. While nothing listens on the port, requests get `503`.
+`max_concurrency` and `env` still apply; `env` has no effect without a process. The slot's phase
+is `:external`.
+
+Use it to put Phoenix in front of a development server, so cookies, hosts and backend routes
+behave as they do in production. See [Setup](setup.md#8-development).
 
 ## Proxy options
 
@@ -44,6 +56,7 @@ Fixed behaviour:
 | Receive timeout | 15 s |
 | No slot available | `503`, `Retry-After: 2`, plain text body |
 | `/__frontend/*` | `404`, never proxied |
+| `X-Forwarded-Host` | Kept if the request has one, otherwise the `Host` header, port included |
 
 `pass_through` is checked before the `/__frontend/` rule, so don't list that prefix.
 
@@ -65,7 +78,8 @@ workers yourself.
 
 Each entry in `status(name).slots` is `%{index, phase, port, node_pid, failures,
 restart_attempt, next_delay}`, where `phase` is one of `:starting`, `:ready`, `:suspect`,
-`:stopping`, `:backoff` or `:cleanup_failed`.
+`:stopping`, `:backoff`, `:cleanup_failed`, or `:external` for an
+[external server](#external-server).
 
 ## Worker protocol
 
