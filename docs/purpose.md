@@ -126,6 +126,6 @@ Separate containers are still the safer default for many teams. Choose them when
 - Build TanStack Start or bundle a Node binary into your release.
 - Generate the AshTypescript client.
 - Serve static assets. Use `Plug.Static` before the proxy.
-- Proxy to a Vite dev server. See [Setup](setup.md#8-development).
+- Run a Vite dev server. It can proxy to one you run; see [Setup](setup.md#phoenix-in-front-of-vite).
 - Expose a public health endpoint. Your app combines `Frontman.workers/1` with its own checks.
 - Configure an OpenTelemetry exporter. It creates spans through the API only.

@@ -427,8 +427,8 @@ request but doesn't need to fail readiness.
 
 ## 8. Development
 
-Frontman runs production builds. It doesn't proxy to the Vite dev server, so in development
-leave `enabled: false` and run Vite yourself. Point Vite's own proxy at Phoenix for backend paths:
+Frontman's workers run production builds. The simplest development setup leaves
+`enabled: false` and runs Vite yourself. Point Vite's own proxy at Phoenix for backend paths:
 
 ```typescript
 // frontend/vite.config.ts
@@ -459,8 +459,22 @@ npm --prefix frontend run build
 config :my_app, :frontend, enabled: true, workers: 2
 ```
 
-If you want Phoenix in front of Vite in development, so cookies and hosts match production,
-you'll need a small proxy of your own. `Frontman.Proxy` only sends requests to pool workers.
+### Phoenix in front of Vite
+
+To keep cookies, hosts and backend routes the same as in production, open Phoenix instead and
+let it proxy page requests to Vite. Start a pool with `port` instead of `executable`, `args` and
+`directory`. Frontman then sends requests to that port and doesn't start, probe or restart
+anything there:
+
+```elixir
+# lib/my_app/application.ex, when MyApp.Frontend.dev?()
+{Frontman, name: MyApp.SSR, port: 5173, max_concurrency: 256}
+```
+
+Run Vite yourself, or as an endpoint watcher. The proxy wrapper and readiness check stay the
+same. A development page loads hundreds of unbundled modules through the proxy, so raise
+`max_concurrency`. Frontman doesn't proxy WebSocket upgrades, so point Vite's HMR client at Vite
+directly with `server.hmr.clientPort`. While Vite isn't listening, page requests get `503`.
 
 ## 9. Ship it in a release
 
