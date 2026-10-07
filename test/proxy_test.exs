@@ -97,6 +97,19 @@ defmodule Frontman.ProxyTest do
     assert response["headers"]["x-forwarded-host"] == "shop.example"
   end
 
+  test "forwards the Host header's port in x-forwarded-host", %{port: port} do
+    register_worker(1, port)
+
+    conn =
+      conn(:get, "/echo")
+      |> Map.put(:host, "app.localhost")
+      # Plug.Test refuses a host request header; adapters such as Bandit keep it.
+      |> Map.update!(:req_headers, &[{"host", "app.localhost:4000"} | &1])
+      |> Proxy.call(Proxy.init(name: TestPool))
+
+    assert Jason.decode!(conn.resp_body)["headers"]["x-forwarded-host"] == "app.localhost:4000"
+  end
+
   test "sends a bodiless status without a chunked body", %{port: port} do
     register_worker(1, port)
 

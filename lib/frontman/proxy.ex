@@ -146,7 +146,9 @@ defmodule Frontman.Proxy do
     end)
     |> Kernel.++([{"x-forwarded-for", forwarded_for}])
     |> put_default("x-forwarded-proto", to_string(conn.scheme))
-    |> put_default("x-forwarded-host", conn.host)
+    # The Host header keeps a non-default port, which `conn.host` drops. The frontend needs it
+    # to rebuild the public origin, for example `localhost:4000` in development.
+    |> put_default("x-forwarded-host", conn |> get_req_header("host") |> List.first(conn.host))
   end
 
   defp put_default(headers, name, value) do
