@@ -84,7 +84,7 @@ restart_attempt, next_delay}`, where `phase` is one of `:starting`, `:ready`, `:
 [external server](#external-server).
 
 `status(name).cache` is `%{entries, bytes, max_entries, max_bytes, hits, misses, stale, stores,
-skips, evicted, invalidated}`. The counters start at zero when the pool starts. `misses` counts
+skips, evicted, invalidated, personalised}`. The counters start at zero when the pool starts. `misses` counts
 requests that found no usable entry, including ones that then shared another request's render.
 
 ## Page cache
@@ -98,6 +98,7 @@ pages and keep them the same for every visitor.
 | `max_bytes` | `64_000_000` | Bytes of bodies and stored headers kept. Positive integer. A page whose body and headers together exceed it isn't stored. |
 | `max_entry_bytes` | `2_000_000`, or `max_bytes` if smaller | Largest body stored. A larger page is proxied and not stored. Can't exceed `max_bytes`. |
 | `query` | `:all` | Which query parameters are part of the key: `:all`, `:ignore`, `{:only, names}` or `{:except, names}`, with names as strings. |
+| `debug` | `false` | Check pages rendered for visitors with credentials, and log why marked pages weren't stored. See [Debug mode](#debug-mode). |
 
 Bad values raise `ArgumentError` at start.
 
@@ -161,6 +162,25 @@ can't remove or mark a page either. The same holds across a cache restart. Waite
 render render their own pages. The check is a single counter, so an invalidation also drops
 renders of unrelated pages that were in flight at the time. They're rendered again on the next
 request.
+
+### Debug mode
+
+With `debug: true`, a GET page that is about to be stored, and whose request carried `Cookie` or
+`Authorization`, goes to Node once more as a background refresh does: without the visitor's
+cookies, credentials or validators. The anonymous render is the one stored, and waiters get it.
+
+Frontman compares the two bodies with every run of digits replaced by `0`, because TanStack
+Start embeds timestamps in each render. If they still differ, it logs a warning with about
+100 bytes of each body around the first difference, emits `[:frontman, :cache, :personalised]`
+and counts it in `status(name).cache.personalised`. If the anonymous render can't be stored,
+nothing is stored and Frontman logs why.
+
+Debug mode also logs a warning whenever a response carries the marker but isn't stored for a
+reason the app controls: an invalid marker, a method other than GET, `Set-Cookie`, a private
+`Cache-Control`, `Vary`, `Content-Encoding`, or size.
+
+The excerpts can contain whatever made the page personal, such as an email address. Use debug
+mode in development builds and staging, not production.
 
 ### Fixed behaviour
 
@@ -290,6 +310,7 @@ Restart reasons are `{:node_exited, reason}`, `{:start_failed, reason}`, `:start
 | `[:frontman, :cache, :skip]` | | `reason`, and `host`, `path`, `query` for GET and HEAD |
 | `[:frontman, :cache, :evict]` | `count`, `bytes` | |
 | `[:frontman, :cache, :invalidate]` | `count` | `host`, and `path` or `prefix` |
+| `[:frontman, :cache, :personalised]` | | `host`, `path`, `query`. [Debug mode](#debug-mode) only. |
 
 `hit`, `stale` and `miss` run in the request process. `skip` does too, except for
 `:invalidated` and a `:too_large` page whose headers took it past `max_bytes`, which the cache

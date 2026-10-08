@@ -8,6 +8,7 @@ defmodule Frontman.Cache do
   # coordinates renders, so concurrent misses on one key send a single request to Node.
   use GenServer
   import Plug.Conn, only: [get_req_header: 2]
+  require Logger
 
   @marker "x-frontman-cache"
   @status_header "x-frontman-cache-status"
@@ -20,7 +21,13 @@ defmodule Frontman.Cache do
   @retry 1_000
   # Last-use times are only rewritten once per interval, so a hot page isn't a hot ETS row.
   @touch 1_000
-  @defaults [max_entries: 10_000, max_bytes: 64_000_000, max_entry_bytes: 2_000_000, query: :all]
+  @defaults [
+    max_entries: 10_000,
+    max_bytes: 64_000_000,
+    max_entry_bytes: 2_000_000,
+    query: :all,
+    debug: false
+  ]
   # Headers that describe one delivery rather than the page.
   @unstored ~w(age connection content-length date keep-alive proxy-authenticate
                proxy-authorization proxy-connection set-cookie te trailer transfer-encoding upgrade
@@ -37,7 +44,18 @@ defmodule Frontman.Cache do
     skip: 5,
     evict: 6,
     invalidate: 7,
-    bytes: 8
+    bytes: 8,
+    personalised: 9
+  }
+  # Skip reasons that mean a page carried the marker but wasn't stored. Debug mode logs these.
+  @refused %{
+    invalid_marker: "the x-frontman-cache header isn't valid",
+    method: "only GET responses are stored",
+    set_cookie: "the response sets a cookie",
+    private: "Cache-Control says private or no-store",
+    vary: "the response varies on a request header other than Accept-Encoding",
+    encoded: "the response has a Content-Encoding",
+    too_large: "the page is larger than the cache allows"
   }
 
   ## Configuration
@@ -69,6 +87,8 @@ defmodule Frontman.Cache do
 
     if config.max_entry_bytes > config.max_bytes,
       do: raise(ArgumentError, "cache max_entry_bytes must not exceed max_bytes")
+
+    unless is_boolean(config.debug), do: raise(ArgumentError, "cache debug must be a boolean")
 
     %{config | query: query_policy!(config.query)}
   end
@@ -109,7 +129,8 @@ defmodule Frontman.Cache do
           epoch: {generation, :atomics.get(epoch, 1)},
           key: nil,
           token: nil,
-          refresh: false
+          refresh: false,
+          verify: nil
         }
 
         if conn.method in ["GET", "HEAD"],
@@ -182,33 +203,87 @@ defmodule Frontman.Cache do
 
   @doc false
   # Renders a page again in the background and stores the result. Runs in a pool task.
-  def refresh_render(ctx, spec) do
-    outcome =
-      case Frontman.checkout(ctx.name) do
-        {:error, _reason} ->
-          {:skip, :unavailable}
+  def refresh_render(ctx, spec), do: finish(ctx, anonymous_render(ctx, spec))
 
-        {:ok, worker} ->
-          try do
-            :get
-            |> Finch.build("http://127.0.0.1:#{worker.port}#{spec.path}", spec.headers)
-            |> Finch.stream_while(
-              Frontman.finch(ctx.name),
-              %{status: nil, capture: capture(ctx)},
-              &collect/2,
-              pool_timeout: 2_000,
-              receive_timeout: 15_000
-            )
-            |> case do
-              {:ok, acc} -> outcome(acc.capture, true)
-              {:error, _error, acc} -> outcome(abort(acc.capture), false)
-            end
-          after
-            Frontman.checkin(worker)
-          end
+  @doc false
+  # Debug mode: a page rendered for a visitor with cookies is rendered again without them. The
+  # anonymous copy is the one stored, and any difference is reported. Runs in a pool task.
+  def verify_render(ctx, spec, visitor) do
+    outcome =
+      case anonymous_render(ctx, spec) do
+        {:store, anonymous} = outcome ->
+          compare(ctx, visitor.body, anonymous.body)
+          outcome
+
+        {:skip, reason} = outcome ->
+          Logger.warning(
+            "Frontman cache: GET #{path(ctx.key)} rendered for a visitor with cookies could " <>
+              "be stored, but without them it couldn't (#{reason}). Nothing was stored."
+          )
+
+          outcome
+
+        nil ->
+          nil
       end
 
     finish(ctx, outcome)
+  end
+
+  # Numbers differ between any two renders (TanStack Start embeds timestamps), so they're
+  # ignored. Text that depends on the visitor, such as a name or an email address, isn't.
+  defp compare(ctx, visitor, anonymous) do
+    visitor = String.replace(visitor, ~r/\d+/, "0")
+    anonymous = String.replace(anonymous, ~r/\d+/, "0")
+
+    if visitor != anonymous do
+      at = :binary.longest_common_prefix([visitor, anonymous])
+
+      Logger.warning("""
+      Frontman cache: GET #{path(ctx.key)} rendered differently without the visitor's cookies, \
+      so the page depends on who asks for it. Stored the anonymous render instead. Check every \
+      loader on this route, including the root's, for cookies or the session.
+        with cookies:    #{excerpt(visitor, at)}
+        without cookies: #{excerpt(anonymous, at)}\
+      """)
+
+      emit(ctx, :personalised, %{}, key_meta(ctx.key))
+    end
+  end
+
+  defp excerpt(body, at) do
+    from = max(at - 40, 0)
+    length = min(byte_size(body) - from, 100)
+    body |> binary_part(from, length) |> String.replace_invalid() |> inspect()
+  end
+
+  defp path({_scheme, host, path, ""}), do: "#{host}#{path}"
+  defp path({_scheme, host, path, query}), do: "#{host}#{path}?#{query}"
+
+  defp anonymous_render(ctx, spec) do
+    case Frontman.checkout(ctx.name) do
+      {:error, _reason} ->
+        {:skip, :unavailable}
+
+      {:ok, worker} ->
+        try do
+          :get
+          |> Finch.build("http://127.0.0.1:#{worker.port}#{spec.path}", spec.headers)
+          |> Finch.stream_while(
+            Frontman.finch(ctx.name),
+            %{status: nil, capture: capture(ctx)},
+            &collect/2,
+            pool_timeout: 2_000,
+            receive_timeout: 15_000
+          )
+          |> case do
+            {:ok, acc} -> outcome(acc.capture, true)
+            {:error, _error, acc} -> outcome(abort(acc.capture), false)
+          end
+        after
+          Frontman.checkin(worker)
+        end
+    end
   end
 
   defp collect({:status, status}, acc), do: {:cont, %{acc | status: status}}
@@ -386,11 +461,22 @@ defmodule Frontman.Cache do
     outcome = if is_nil(outcome) and ctx.key, do: {:skip, :unavailable}, else: outcome
 
     case outcome do
-      {:skip, reason} -> emit(ctx, :skip, %{}, Map.put(key_meta(ctx.key), :reason, reason))
-      _other -> :ok
+      {:skip, reason} ->
+        emit(ctx, :skip, %{}, Map.put(key_meta(ctx.key), :reason, reason))
+        if ctx.config.debug, do: explain(ctx, reason)
+
+      _other ->
+        :ok
     end
 
-    if ctx.key && match?({kind, _} when kind in [:store, :skip], outcome) do
+    # In debug mode, a page rendered for a visitor with credentials is checked first.
+    outcome =
+      case outcome do
+        {:store, entry} when ctx.verify != nil -> {:verify, entry, ctx.verify}
+        outcome -> outcome
+      end
+
+    if ctx.key && reported?(outcome) do
       GenServer.cast(
         Frontman.cache(ctx.name),
         {:complete, ctx.key, ctx.token, outcome, ctx.epoch, ctx.refresh}
@@ -398,6 +484,27 @@ defmodule Frontman.Cache do
     end
 
     :ok
+  end
+
+  defp reported?({kind, _}) when kind in [:store, :skip], do: true
+  defp reported?({:verify, _entry, _spec}), do: true
+  defp reported?(_other), do: false
+
+  @doc false
+  def debug?(ctx), do: ctx.config.debug
+
+  defp explain(ctx, reason) do
+    case @refused do
+      %{^reason => why} ->
+        target = if ctx.key, do: "GET #{path(ctx.key)}", else: "A response"
+
+        Logger.warning(
+          "Frontman cache: #{target} has the x-frontman-cache marker but wasn't stored: #{why}."
+        )
+
+      _other ->
+        :ok
+    end
   end
 
   ## Serving
@@ -532,7 +639,8 @@ defmodule Frontman.Cache do
           stores: count.(:store),
           skips: count.(:skip),
           evicted: count.(:evict),
-          invalidated: count.(:invalidate)
+          invalidated: count.(:invalidate),
+          personalised: count.(:personalised)
         }
     end
   rescue
@@ -638,6 +746,29 @@ defmodule Frontman.Cache do
     {:noreply, reply_all(state, flight, :render)}
   end
 
+  def handle_cast({:complete, key, token, {:verify, entry, spec}, epoch, _refresh}, state) do
+    if epoch == current_epoch(state) do
+      ctx = %{
+        name: state.name,
+        config: state.config,
+        counters: state.counters,
+        epoch: epoch,
+        key: key,
+        token: token,
+        refresh: false,
+        verify: nil
+      }
+
+      # The check takes over the render's flight, so waiters get the anonymous copy.
+      case start_task(state.name, fn -> verify_render(ctx, spec, entry) end) do
+        {:ok, pid} -> {:noreply, hand_over(state, key, token, pid)}
+        :error -> handle_cast({:complete, key, token, {:skip, :unavailable}, epoch, false}, state)
+      end
+    else
+      handle_cast({:complete, key, token, {:store, entry}, epoch, false}, state)
+    end
+  end
+
   def handle_cast({:complete, key, token, outcome, epoch, refresh}, state) do
     {flight, state} = end_flight(state, key, token)
 
@@ -699,7 +830,8 @@ defmodule Frontman.Cache do
       key: key,
       token: token,
       # The copy being refreshed, so a late result can't remove a newer one.
-      refresh: copy
+      refresh: copy,
+      verify: nil
     }
 
     with true <- :ets.update_element(entries, key, {4, now() + @wait}),
@@ -766,6 +898,24 @@ defmodule Frontman.Cache do
       | flights: Map.put(state.flights, key, flight),
         monitors: Map.put(state.monitors, ref, key)
     }
+  end
+
+  defp hand_over(state, key, token, pid) do
+    case state.flights do
+      %{^key => %{token: ^token} = flight} ->
+        Process.demonitor(flight.monitor, [:flush])
+        ref = Process.monitor(pid)
+        monitors = state.monitors |> Map.delete(flight.monitor) |> Map.put(ref, key)
+
+        %{
+          state
+          | flights: Map.put(state.flights, key, %{flight | monitor: ref}),
+            monitors: monitors
+        }
+
+      _other ->
+        state
+    end
   end
 
   defp end_flight(state, key, token) do

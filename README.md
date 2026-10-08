@@ -224,6 +224,14 @@ the starter app, marking `/about` cacheable while the root loader still loaded t
 the signed-in user's email and served it to an anonymous visitor. Load the session on the
 client for cacheable routes, or keep it out of their tree.
 
+To catch this before production, turn on `debug: true` in a staging or local release. Frontman
+then renders every marked page that was requested with cookies or an `Authorization` header a
+second time without them. It stores the anonymous copy, and logs a warning with the first
+difference if the two don't match. In the starter, that warning pointed straight at the root
+layout's signed-in navigation. Debug mode also logs why a marked page wasn't stored. It costs
+one extra render per stored page, and the log can contain personal data, so leave it off in
+production.
+
 The host in the key is the one Node is told: `X-Forwarded-Host` if the request has one,
 otherwise `Host`. The scheme comes from `X-Forwarded-Proto`. A request with a forged
 `X-Forwarded-Host` can only fill an entry for that forged host.

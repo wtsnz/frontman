@@ -74,6 +74,7 @@ defmodule Frontman.Proxy do
   # Proxies as usual, capturing the response, then reports how it went. A leader that never
   # reports would leave its waiters to time out.
   defp render(conn, ctx) do
+    ctx = verify(conn, ctx)
     conn = conn |> put_private(:frontman_cache, ctx) |> proxy()
     Cache.finish(ctx, conn.private[:frontman_cache_outcome])
     conn
@@ -82,6 +83,16 @@ defmodule Frontman.Proxy do
       Cache.finish(ctx, {:skip, :aborted})
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
+
+  # Debug mode checks a GET page rendered with the visitor's credentials against one without.
+  defp verify(%{method: "GET"} = conn, %{key: key} = ctx) when key != nil do
+    if Cache.debug?(ctx) and
+         Enum.any?(["cookie", "authorization"], &(get_req_header(conn, &1) != [])),
+       do: %{ctx | verify: refresh_spec(conn)},
+       else: ctx
+  end
+
+  defp verify(_conn, ctx), do: ctx
 
   defp send_cached(conn, entry, label) do
     {status, headers, body} = Cache.response(conn, entry, label)
