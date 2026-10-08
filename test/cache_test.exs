@@ -442,6 +442,20 @@ defmodule Frontman.CacheTest do
       assert stats().entries == 0
     end
 
+    test "a render that outlives a cache restart doesn't store into the new cache" do
+      request = Task.async(fn -> get("/hold") end)
+      node = held()
+      assert {:ok, 0} = Frontman.invalidate(@pool, path: "/hold")
+
+      # The new cache counts invalidations from zero again; the old render must still lose.
+      stop_supervised!(Frontman.Cache)
+      start_supervised!({Frontman.Cache, name: @pool, config: Frontman.Cache.config!([])})
+      send(node, :release)
+      assert Task.await(request).status == 200
+      assert stats().entries == 0
+      assert header(get("/hold-plain"), "x-frontman-cache-status") == nil
+    end
+
     test "rejects ambiguous options and reports a pool without a cache" do
       assert_raise ArgumentError, fn -> Frontman.invalidate(@pool, host: "x") end
       assert_raise ArgumentError, fn -> Frontman.invalidate(@pool, path: "/a", prefix: "/") end
@@ -497,6 +511,27 @@ defmodule Frontman.CacheTest do
       assert stats.bytes <= 3_000
       assert stats.evicted == 1
     end
+  end
+
+  @tag cache: [max_bytes: 1_000]
+  test "max_bytes holds even when a body fits max_entry_bytes but its headers don't" do
+    assert byte_size(get("/sized?n=1000").resp_body) == 1_000
+    assert_receive {:telemetry, :skip, _, %{reason: :too_large}}
+    assert %{entries: 0, bytes: 0} = stats()
+  end
+
+  test "a late refresh request for a page that is fresh again starts nothing" do
+    get("/swr")
+    assert renders("/swr") == 1
+    stats()
+
+    GenServer.cast(
+      Frontman.cache(@pool),
+      {:refresh, {"http", "www.example.com", "/swr", ""}, %{path: "/swr", headers: []}}
+    )
+
+    stats()
+    refute_receive {:rendered, "/swr", _}, 200
   end
 
   describe "drain and shutdown" do

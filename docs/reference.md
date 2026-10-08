@@ -95,7 +95,7 @@ pages and keep them the same for every visitor.
 | Option | Default | Description |
 | --- | --- | --- |
 | `max_entries` | `10_000` | Pages kept. Positive integer. |
-| `max_bytes` | `64_000_000` | Bytes of bodies and stored headers kept. Positive integer. |
+| `max_bytes` | `64_000_000` | Bytes of bodies and stored headers kept. Positive integer. A page whose body and headers together exceed it isn't stored. |
 | `max_entry_bytes` | `2_000_000`, or `max_bytes` if smaller | Largest body stored. A larger page is proxied and not stored. Can't exceed `max_bytes`. |
 | `query` | `:all` | Which query parameters are part of the key: `:all`, `:ignore`, `{:only, names}` or `{:except, names}`, with names as strings. |
 
@@ -156,7 +156,8 @@ Frontman.invalidate(MyApp.SSR, host: "www.example.com", prefix: "/blog/")
 every query string and scheme. `host` is compared with the key's host, lowercased, port
 included. Exactly one of `path` and `prefix` is required.
 
-After `invalidate/2` returns, nothing rendered before the call is stored. Waiters on such a
+After `invalidate/2` returns, nothing rendered before the call is stored, and such a render
+can't remove or mark a page either. The same holds across a cache restart. Waiters on such a
 render render their own pages. The check is a single counter, so an invalidation also drops
 renders of unrelated pages that were in flight at the time. They're rendered again on the next
 request.

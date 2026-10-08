@@ -99,12 +99,12 @@ defmodule Frontman.Cache do
       nil ->
         :disabled
 
-      {config, counters, epoch} ->
+      {config, counters, {generation, epoch}} ->
         ctx = %{
           name: name,
           config: config,
           counters: counters,
-          epoch: :atomics.get(epoch, 1),
+          epoch: {generation, :atomics.get(epoch, 1)},
           key: nil,
           token: nil,
           refresh: false
@@ -547,7 +547,9 @@ defmodule Frontman.Cache do
     name = Keyword.fetch!(opts, :name)
     config = Keyword.fetch!(opts, :config)
     counters = :counters.new(map_size(@counters), [:write_concurrency])
-    epoch = :atomics.new(1, [])
+    # A restarted cache counts invalidations from zero again. The generation tells its renders
+    # apart from those that started under the cache it replaced.
+    epoch = {make_ref(), :atomics.new(1, [])}
 
     # Entries are public so request processes can record use. Everything else is written here.
     :ets.new(table(name, :entries), [
@@ -603,7 +605,7 @@ defmodule Frontman.Cache do
 
   def handle_call({:invalidate, match}, _from, state) do
     # Renders that started before this call must not store what they rendered.
-    :atomics.add(state.epoch, 1, 1)
+    :atomics.add(elem(state.epoch, 1), 1, 1)
 
     keys =
       state.name
@@ -629,30 +631,59 @@ defmodule Frontman.Cache do
     {:noreply, state}
   end
 
-  def handle_cast({:complete, key, token, outcome, epoch, refresh?}, state) do
+  def handle_cast({:complete, key, token, outcome, epoch, refresh}, state) do
     {flight, state} = end_flight(state, key, token)
 
     state =
-      case outcome do
-        {:store, entry} ->
-          if epoch == :atomics.get(state.epoch, 1) do
-            reply_all(flight, {:entry, entry})
-            store(state, key, entry)
-          else
-            reply_all(flight, :render)
-            emit(state, :skip, %{}, Map.put(key_meta(key), :reason, :invalidated))
-            state
-          end
-
-        {:skip, reason} ->
+      cond do
+        # Rendered before an invalidation, or under a cache this one replaced: it may not
+        # change anything, stored page or pass mark.
+        epoch != current_epoch(state) ->
           reply_all(flight, :render)
-          skipped(state, key, reason, refresh?)
+
+          if match?({:store, _}, outcome),
+            do: emit(state, :skip, %{}, Map.put(key_meta(key), :reason, :invalidated))
+
+          state
+
+        match?({:store, _}, outcome) ->
+          {:store, entry} = outcome
+          reply_all(flight, {:entry, entry})
+          store(state, key, entry)
+
+        true ->
+          {:skip, reason} = outcome
+          reply_all(flight, :render)
+          skipped(state, key, reason, refresh)
       end
 
     {:noreply, state}
   end
 
   def handle_cast({:refresh, key, spec}, state) do
+    case refreshable(state, key) do
+      {:ok, stored_at} -> {:noreply, start_refresh(state, key, spec, stored_at)}
+      :error -> {:noreply, state}
+    end
+  end
+
+  # A cast can arrive late, after another refresh replaced the page or failed and set a retry
+  # time. Only a copy that is still stale and due gets a refresh.
+  defp refreshable(state, key) do
+    now = now()
+
+    with false <- Map.has_key?(state.flights, key),
+         [{^key, entry, _used, refresh_at, _bytes}] <-
+           :ets.lookup(table(state.name, :entries), key),
+         age = now - entry.stored_at,
+         true <- not fresh?(entry, age) and servable?(entry, age) and refresh_at <= now do
+      {:ok, entry.stored_at}
+    else
+      _no -> :error
+    end
+  end
+
+  defp start_refresh(state, key, spec, stored_at) do
     entries = table(state.name, :entries)
     token = make_ref()
 
@@ -660,18 +691,18 @@ defmodule Frontman.Cache do
       name: state.name,
       config: state.config,
       counters: state.counters,
-      epoch: :atomics.get(state.epoch, 1),
+      epoch: current_epoch(state),
       key: key,
       token: token,
-      refresh: true
+      # The copy being refreshed, so a late result can't remove a newer one.
+      refresh: stored_at
     }
 
-    with false <- Map.has_key?(state.flights, key),
-         true <- :ets.update_element(entries, key, {4, now() + @wait}),
+    with true <- :ets.update_element(entries, key, {4, now() + @wait}),
          {:ok, pid} <- start_task(state.name, fn -> refresh_render(ctx, spec) end) do
-      {:noreply, start_flight(state, key, pid, token, true)}
+      start_flight(state, key, pid, token, stored_at)
     else
-      _skip -> {:noreply, state}
+      _failed -> state
     end
   end
 
@@ -684,8 +715,21 @@ defmodule Frontman.Cache do
       {key, monitors} ->
         {flight, flights} = Map.pop(state.flights, key)
         reply_all(flight, :render)
-        if flight.refresh, do: retry_later(state, key)
+        if flight.refresh, do: retry_later(state, key, flight.refresh)
         {:noreply, %{state | flights: flights, monitors: monitors}}
+    end
+  end
+
+  # Waiters give up after @wait on their side. Let go of them here too, so a slow render
+  # doesn't hold on to callers that have left. The render itself can still store its page.
+  def handle_info({:expire, key, token}, state) do
+    case state.flights do
+      %{^key => %{token: ^token} = flight} ->
+        reply_all(flight, :render)
+        {:noreply, put_in(state.flights[key], %{flight | waiters: []})}
+
+      _other ->
+        {:noreply, state}
     end
   end
 
@@ -695,9 +739,10 @@ defmodule Frontman.Cache do
     :exit, _reason -> :error
   end
 
-  defp start_flight(state, key, pid, token, refresh?) do
+  defp start_flight(state, key, pid, token, refresh) do
     ref = Process.monitor(pid)
-    flight = %{token: token, monitor: ref, waiters: [], refresh: refresh?, started: now()}
+    Process.send_after(self(), {:expire, key, token}, @wait)
+    flight = %{token: token, monitor: ref, waiters: [], refresh: refresh, started: now()}
 
     %{
       state
@@ -736,24 +781,47 @@ defmodule Frontman.Cache do
     end
   end
 
-  defp skipped(state, key, reason, refresh?) when reason in @inconclusive do
-    if refresh?, do: retry_later(state, key)
+  defp skipped(state, key, reason, refresh) when reason in @inconclusive do
+    if refresh, do: retry_later(state, key, refresh)
     state
   end
 
-  defp skipped(state, key, _reason, refresh?) do
+  defp skipped(state, key, _reason, refresh) do
     passes = table(state.name, :passes)
     # Bounded without bookkeeping: past the entry limit, forget every pass at once.
     if :ets.info(passes, :size) >= state.config.max_entries, do: :ets.delete_all_objects(passes)
     :ets.insert(passes, {key})
 
-    # A refresh that isn't cacheable means the page no longer is. A visitor's render only
-    # replaces a copy that can't be served any more.
-    if refresh? or servable(state, key) == :error, do: delete(state, key), else: state
+    # A refresh that isn't cacheable means the page no longer is, if the copy it refreshed is
+    # still the one stored. A visitor's render only replaces a copy that can't be served.
+    cond do
+      refresh -> if stored_at(state, key) == refresh, do: delete(state, key), else: state
+      servable(state, key) == :error -> delete(state, key)
+      true -> state
+    end
   end
 
-  defp retry_later(state, key),
-    do: :ets.update_element(table(state.name, :entries), key, {4, now() + @retry})
+  defp retry_later(state, key, stored_at) do
+    if stored_at(state, key) == stored_at,
+      do: :ets.update_element(table(state.name, :entries), key, {4, now() + @retry})
+  end
+
+  defp stored_at(state, key) do
+    case :ets.lookup(table(state.name, :entries), key) do
+      [{^key, entry, _used, _refresh_at, _bytes}] -> entry.stored_at
+      [] -> nil
+    end
+  end
+
+  defp current_epoch(%{epoch: {generation, counter}}),
+    do: {generation, :atomics.get(counter, 1)}
+
+  # Headers count towards the bound too, so a body just under max_entry_bytes can still be
+  # too big to keep.
+  defp store(state, key, %{bytes: bytes}) when bytes > state.config.max_bytes do
+    emit(state, :skip, %{}, Map.put(key_meta(key), :reason, :too_large))
+    state
+  end
 
   defp store(state, key, entry) do
     entries = table(state.name, :entries)

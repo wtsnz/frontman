@@ -177,9 +177,10 @@ removes it.
 ### Invalidation
 
 `Frontman.invalidate/2` runs in the server. It removes the matching pages and increments a
-counter. Every render records the counter when it starts, and the server drops a finished
-render whose counter is out of date. So a render that read old data before an invalidation
-can't store it afterwards.
+counter. Every render records the counter, and a reference unique to the running cache, when it
+starts. The server ignores a finished render whose counter or reference is out of date. So a
+render that read old data before an invalidation can't store it afterwards, even if the cache
+restarted in between.
 
 ### Admission and drain
 
