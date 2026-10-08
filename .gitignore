@@ -2,3 +2,4 @@
 /deps/
 /frontman-*.tar
 /erl_crash.dump
+/tmp/
