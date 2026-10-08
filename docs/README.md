@@ -7,6 +7,6 @@
 | [How it works](architecture.md) | Supervision tree, admission, the request path, worker lifecycle, process cleanup and drain |
 | [Operations](operations.md) | Status, deploying with a drain, tuning, telemetry to watch, failure modes and limits |
 | [Reference](reference.md) | Every option, function, telemetry event, and the worker protocol |
-| [Measurements](measurements.md) | The environment and results behind the navigation CPU comparison |
+| [Measurements](measurements.md) | The environment and results behind the navigation CPU comparison and the page cache benchmark |
 
 New here? Read [Purpose](purpose.md), then [Setup](setup.md).

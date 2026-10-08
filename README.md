@@ -71,6 +71,8 @@ containers is still the better choice.
   `X-Forwarded-*` headers intact.
 - Caps concurrent requests per worker and answers `503` with `Retry-After: 2` when full.
 - Drains and resumes the pool for deploys, and emits telemetry and OpenTelemetry spans.
+- Optionally caches pages that Node marks as the same for every visitor, in memory on each node,
+  rendering each one once under load.
 - Packages a release: `mix frontman.package` builds the frontend with a pinned,
   checksum-verified Node and copies Node and the build into `priv`.
 
@@ -152,6 +154,171 @@ These snippets assume a Nitro Node server build. [docs/setup.md](docs/setup.md) 
 Nitro build configuration, the trusted public origin, static assets, both loader transports,
 health checks, development and releases.
 
+## Page cache
+
+The cache is off unless you configure it. Turn it on per pool:
+
+```elixir
+{Frontman,
+ name: MyApp.SSR,
+ # ...executable, args, directory, workers
+ cache: [
+   max_entries: 10_000,
+   max_bytes: 64_000_000,
+   query: {:except, ["utm_source", "utm_medium", "utm_campaign", "gclid", "fbclid"]}
+ ]}
+```
+
+Frontman then stores a page only when Node marks the response with an `x-frontman-cache`
+header. Everything else is proxied exactly as before. The header never reaches the browser.
+
+### Mark a TanStack Start route
+
+Start merges the `headers` of every matched route into the page response, so a route marks
+itself:
+
+```typescript
+// frontend/src/lib/cache.ts
+// Frontman never caches under the Vite dev server, and this keeps the header out of it too.
+export const cacheable =
+  (directives = "public") =>
+  () =>
+    import.meta.env.DEV ? {} : { "x-frontman-cache": directives };
+```
+
+```tsx
+// frontend/src/routes/pricing.tsx
+import { createFileRoute } from "@tanstack/react-router";
+import { cacheable } from "../lib/cache";
+
+export const Route = createFileRoute("/pricing")({
+  headers: cacheable("public, max-age=300, stale-while-revalidate=3600"),
+  loader: () => loadPlans(),
+  component: Pricing,
+});
+```
+
+| Directive | Meaning |
+| --- | --- |
+| `public` | Required. The HTML is the same for every visitor. |
+| `max-age=N` | Fresh for N seconds. After that the next request renders it again. |
+| `stale-while-revalidate=N` | For N seconds past `max-age`, serve the old copy while one background render replaces it. Needs `max-age`. |
+
+Without `max-age`, a page stays until you invalidate it, the cache evicts it, or the node
+restarts. Each node starts empty, so a deploy always serves fresh pages. A header with any other
+directive is ignored and the page isn't stored.
+
+### Keep cached pages the same for everyone
+
+The cache key is the host, path and query string. Frontman never keys or varies on cookies or
+other request headers, so every visitor gets the HTML of whichever request rendered the page.
+Personalise in the browser instead:
+
+- load the visitor's data after hydration, for example from `/rpc/run`; or
+- set a readable hint cookie such as `signed_in=1` at login, copy it onto `<html>` with a
+  small inline script, and let CSS show "Account" instead of "Sign in".
+
+Every loader in the matched route tree runs during a cached render, including the root route's.
+If the root loader reads the session, the first visitor's account ends up in everyone's page. In
+the starter app, marking `/about` cacheable while the root loader still loaded the session cached
+the signed-in user's email and served it to an anonymous visitor. Load the session on the
+client for cacheable routes, or keep it out of their tree.
+
+The host in the key is the one Node is told: `X-Forwarded-Host` if the request has one,
+otherwise `Host`. The scheme comes from `X-Forwarded-Proto`. A request with a forged
+`X-Forwarded-Host` can only fill an entry for that forged host.
+
+### Query strings
+
+| `query` | Key |
+| --- | --- |
+| `:all` (default) | Every parameter. Order doesn't matter: `?b=2&a=1` and `?a=1&b=2` share an entry. |
+| `{:except, names}` | Every parameter except these. Use it for tracking parameters. |
+| `{:only, names}` | Only these parameters. |
+| `:ignore` | The path alone. |
+
+Parameters left out of the key still reach Node for the render that fills the entry, so they
+must not change the HTML. Keep any parameter a route's `validateSearch` or `loaderDeps` reads in
+the key. Every distinct key is a separate render and entry, so `max_entries` also bounds what a
+client can do by making up query strings.
+
+### Never stored
+
+Frontman doesn't store, whatever the marker says:
+
+- a response with `Set-Cookie`;
+- a status other than 200;
+- a method other than GET (HEAD is answered from a stored GET, and a HEAD miss goes to Node);
+- a response that fails or is cut off part-way, including when the client disconnects;
+- `Cache-Control: private` or `no-store`, `Vary` on anything but `Accept-Encoding`, or a
+  `Content-Encoding`;
+- a body over `max_entry_bytes`.
+
+### What browsers and CDNs see
+
+Frontman never makes a page more cacheable downstream than Node did. Node's own
+`Cache-Control` passes through. If Node sent none, Frontman adds `Cache-Control: no-cache`:
+browsers keep the page but revalidate it every time, and Frontman answers with a `304` from
+memory, so an invalidation takes effect on the next request. If you send
+`public, max-age=3600` yourself, browsers and CDNs keep the page that long and
+`Frontman.invalidate/2` can't reach their copies.
+
+Stored pages carry Node's `ETag`, or a weak one Frontman computes from the body, plus `Age`
+and `x-frontman-cache-status: hit`, `stale` or `miss`. `If-None-Match` is answered from the
+cache.
+
+### Invalidate
+
+```elixir
+Frontman.invalidate(MyApp.SSR, path: "/pricing")              # every query string
+Frontman.invalidate(MyApp.SSR, host: "www.example.com", path: "/")
+Frontman.invalidate(MyApp.SSR, prefix: "/blog/")
+```
+
+It returns `{:ok, removed}`. A render that started before the call isn't stored afterwards.
+
+Invalidation only reaches the node you call it on. A cluster broadcasts it, for example over
+Phoenix.PubSub, which also delivers to the sending node:
+
+```elixir
+# After publishing a post
+Phoenix.PubSub.broadcast(MyApp.PubSub, "page_cache", {:invalidate, prefix: "/blog/"})
+
+# Started on every node
+defmodule MyApp.PageCacheInvalidator do
+  use GenServer
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil)
+
+  def init(nil) do
+    Phoenix.PubSub.subscribe(MyApp.PubSub, "page_cache")
+    {:ok, nil}
+  end
+
+  def handle_info({:invalidate, opts}, state) do
+    Frontman.invalidate(MyApp.SSR, opts)
+    {:noreply, state}
+  end
+end
+```
+
+### Under load
+
+When many requests miss the same page at once, one goes to Node and the rest wait for it, for
+up to 15 seconds. Waiting requests hold no admission slot. If the page turns out cacheable they
+share it; if not, each renders its own through normal admission, and gets a 503 when the pool
+is full. Hits don't need a slot at all, so they're served during a drain and while no worker
+is ready.
+
+On one laptop, a cached page cost 0.07 ms of CPU against 1.15 ms for the same page rendered by
+Node. See [Measurements](docs/measurements.md#page-cache).
+
+### Development
+
+A pool with `port`, which is how Phoenix fronts the Vite dev server, ignores `cache` and logs a
+warning, so HMR and live reload see every request. [Reference](docs/reference.md#page-cache)
+lists every option, header and telemetry event.
+
 ## Documentation
 
 | Guide | Read it when |
@@ -161,7 +328,7 @@ health checks, development and releases.
 | [How it works](docs/architecture.md) | You want the supervision tree, request path and worker lifecycle |
 | [Operations](docs/operations.md) | You're deploying, draining, or watching telemetry |
 | [Reference](docs/reference.md) | You need an option, function, event or the worker protocol |
-| [Measurements](docs/measurements.md) | You want the environment and results behind the CPU comparison |
+| [Measurements](docs/measurements.md) | You want the environment and results behind the CPU comparisons |
 
 ## Known limits
 
@@ -171,6 +338,7 @@ health checks, development and releases.
 - Cleanup signals the Node process MuonTrap started, not its descendants. There's no cgroup
   containment, so a killed MuonTrap wrapper can orphan Node on some systems.
 - Phoenix sits on the page path. If Phoenix is down, pages are down with it.
+- The page cache is per node and in memory. Clustered apps broadcast invalidations themselves.
 
 [docs/operations.md](docs/operations.md#limits) lists the rest.
 
@@ -188,10 +356,11 @@ mix hex.build
 ```
 
 The tests run the proxy against a real Bandit upstream and the workers against real Node
-processes. To watch admission and drain work end to end:
+processes. To watch admission, drain and the page cache work end to end:
 
 ```sh
 MIX_ENV=test mix run examples/admission.exs
+MIX_ENV=test mix run examples/page_cache.exs
 ```
 
 `mix hex.build` only builds a local tarball. Publishing to Hex is a separate, manual step.
