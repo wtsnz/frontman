@@ -21,6 +21,7 @@ Pass these to `{Frontman, opts}` or `Frontman.start_link/1`.
 | `restart_backoff_min` | `250` | First backoff ceiling, in milliseconds. |
 | `restart_backoff_max` | `30_000` | Largest backoff ceiling, in milliseconds. |
 | `restart_backoff_reset_after` | `30_000` | Milliseconds a worker must stay ready before its attempt count resets. |
+| `cache` | off | Keyword list of [page cache](#page-cache) options, or `true` for the defaults. `nil` or `false` leaves it off. Ignored, with a warning, alongside `port`. |
 
 All timing options must be positive integers, and `restart_backoff_min` can't exceed
 `restart_backoff_max`. Bad values raise `ArgumentError` at start.
@@ -66,10 +67,11 @@ Fixed behaviour:
 | --- | --- |
 | `Frontman.start_link(opts)` | `{:ok, pid}`. Starts a pool. `{Frontman, opts}` works as a child spec. |
 | `Frontman.workers(name)` | Ready workers: `%{index, port, node_pid, pid, in_flight, state}`. `state` is `:ready` or `:draining`. `[]` if the pool isn't running. |
-| `Frontman.status(name)` | `%{mode, in_flight, capacity, max_concurrency, workers, slots}`, or `nil` if the pool isn't running. |
+| `Frontman.status(name)` | `%{mode, in_flight, capacity, max_concurrency, workers, slots, cache}`, or `nil` if the pool isn't running. `cache` is `nil` without a page cache. |
 | `Frontman.drain(name, timeout: ms)` | `:ok` when every lease has ended, `{:error, :timeout}`, or `{:error, :unavailable}`. Default timeout 5,000 ms. Leaves the pool closed. |
 | `Frontman.resume(name)` | `:ok`, `{:error, :drain_in_progress}`, or `{:error, :unavailable}`. |
 | `Frontman.stop(name, timeout: ms)` | Drains, stops the pool, and returns the drain result. `{:error, :unavailable}` if not running. |
+| `Frontman.invalidate(name, opts)` | `{:ok, removed}` or `{:error, :unavailable}` when the pool has no cache. Takes `path:` or `prefix:`, and optionally `host:`. See [Invalidation](#invalidation). |
 | `Frontman.checkout(name, excluded \\ [])` | `{:ok, worker}` with a `:lease`, or `{:error, :draining \| :unavailable \| :overloaded}`. The calling process owns the lease. |
 | `Frontman.checkin(worker)` | `:ok`. Ends the lease. Safe to call twice. |
 
@@ -80,6 +82,98 @@ Each entry in `status(name).slots` is `%{index, phase, port, node_pid, failures,
 restart_attempt, next_delay}`, where `phase` is one of `:starting`, `:ready`, `:suspect`,
 `:stopping`, `:backoff`, `:cleanup_failed`, or `:external` for an
 [external server](#external-server).
+
+`status(name).cache` is `%{entries, bytes, max_entries, max_bytes, hits, misses, stale, stores,
+skips, evicted, invalidated}`. The counters start at zero when the pool starts. `misses` counts
+requests that found no usable entry, including ones that then shared another request's render.
+
+## Page cache
+
+Set with the pool's `cache` option. See the [README](../README.md#page-cache) for how to mark
+pages and keep them the same for every visitor.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `max_entries` | `10_000` | Pages kept. Positive integer. |
+| `max_bytes` | `64_000_000` | Bytes of bodies and stored headers kept. Positive integer. A page whose body and headers together exceed it isn't stored. |
+| `max_entry_bytes` | `2_000_000`, or `max_bytes` if smaller | Largest body stored. A larger page is proxied and not stored. Can't exceed `max_bytes`. |
+| `query` | `:all` | Which query parameters are part of the key: `:all`, `:ignore`, `{:only, names}` or `{:except, names}`, with names as strings. |
+
+Bad values raise `ArgumentError` at start.
+
+### Marker
+
+Node opts a response in with `x-frontman-cache`, a comma-separated list of directives:
+
+| Directive | |
+| --- | --- |
+| `public` | Required. |
+| `max-age=N` | Seconds the page is fresh. Without it, the page stays until invalidated or evicted. |
+| `stale-while-revalidate=N` | Seconds past `max-age` during which the old copy is served while one background render replaces it. Needs `max-age`. |
+
+Frontman removes the header from every response while the pool has a cache, stored or not.
+Without a cache the header passes through untouched.
+
+A marked response is stored only if the request was a GET, the status is 200, and the response
+has no `Set-Cookie`, no `Cache-Control: private` or `no-store`, no `Vary` other than
+`Accept-Encoding`, no `Content-Encoding`, a body within `max_entry_bytes`, and arrived in full.
+
+### Key
+
+`{scheme, host, path, query}`:
+
+- scheme from `X-Forwarded-Proto`, otherwise the connection's;
+- host from `X-Forwarded-Host`, otherwise `Host`, lowercased and with any port;
+- the raw request path;
+- the query parameters the `query` option keeps, sorted by name, keeping repeated parameters
+  in order.
+
+### Response headers
+
+| Header | Value |
+| --- | --- |
+| `x-frontman-cache-status` | `miss` on the render that stores a page, `hit` from memory, `stale` from memory while a refresh runs. Absent when the response wasn't from or for the cache. |
+| `cache-control` | Node's. `no-cache` if Node sent none. |
+| `etag` | Node's, or `W/"<hash>"` from the body's SHA-256. The render that stores a page has only Node's. |
+| `age` | Seconds since the page was stored. |
+
+Stored pages keep Node's other headers except `date`, `set-cookie`, `x-request-id`,
+`content-length` and hop-by-hop headers. Phoenix's own `x-request-id` is kept.
+
+A request whose `If-None-Match` matches the stored ETag, compared weakly, or is `*`, gets a
+`304` with `cache-control`, `content-location`, `etag`, `expires`, `vary`, `age` and the status
+header. On a cache fill, Frontman removes `If-None-Match` and `If-Modified-Since` before asking
+Node, so Node returns the full page.
+
+### Invalidation
+
+```elixir
+Frontman.invalidate(MyApp.SSR, path: "/pricing")
+Frontman.invalidate(MyApp.SSR, host: "www.example.com", prefix: "/blog/")
+```
+
+`path` matches one path exactly and `prefix` every path that starts with it. Either matches
+every query string and scheme. `host` is compared with the key's host, lowercased, port
+included. Exactly one of `path` and `prefix` is required.
+
+After `invalidate/2` returns, nothing rendered before the call is stored, and such a render
+can't remove or mark a page either. The same holds across a cache restart. Waiters on such a
+render render their own pages. The check is a single counter, so an invalidation also drops
+renders of unrelated pages that were in flight at the time. They're rendered again on the next
+request.
+
+### Fixed behaviour
+
+| | |
+| --- | --- |
+| Wait for another request's render | Up to 15 s, then render alone |
+| Waiters per page | 1,000. Past that, requests render through admission. |
+| Background refresh | One per page at a time, without the visitor's `Cookie`, `Authorization` or validators |
+| After a failed refresh | The stale copy stays; the next refresh starts no sooner than 1 s later |
+| Refresh that isn't cacheable, apart from a 5xx or no response | Removes the page |
+| Eviction | Past either bound, least recently used pages go until both are at 90% |
+| Recency | Updated at most once a second per page |
+| Uncacheable pages | Remembered, so later misses on them don't wait. The list is cleared when it reaches `max_entries`. |
 
 ## `mix frontman.package`
 
@@ -184,6 +278,34 @@ each attempt.
 
 Restart reasons are `{:node_exited, reason}`, `{:start_failed, reason}`, `:startup_timeout` and
 `:health_check_failed`.
+
+### Page cache
+
+| Event | Measurements | Metadata |
+| --- | --- | --- |
+| `[:frontman, :cache, :hit]` | `age` (ms), `bytes` | `host`, `path`, `query` |
+| `[:frontman, :cache, :stale]` | `age` (ms), `bytes` | `host`, `path`, `query` |
+| `[:frontman, :cache, :miss]` | | `host`, `path`, `query` |
+| `[:frontman, :cache, :store]` | `bytes` | `host`, `path`, `query` |
+| `[:frontman, :cache, :skip]` | | `reason`, and `host`, `path`, `query` for GET and HEAD |
+| `[:frontman, :cache, :evict]` | `count`, `bytes` | |
+| `[:frontman, :cache, :invalidate]` | `count` | `host`, and `path` or `prefix` |
+
+`hit`, `stale` and `miss` run in the request process. `skip` does too, except for
+`:invalidated` and a `:too_large` page whose headers took it past `max_bytes`, which the cache
+server emits along with `store`, `evict` and `invalidate`. Skip reasons:
+
+| Reason | |
+| --- | --- |
+| `:not_marked` | A GET page without the marker. Expected for every personal page. |
+| `:invalid_marker` | The marker had an unknown or malformed directive, or no `public`. |
+| `:method` | A marked response to a method other than GET. |
+| `:status`, `:error` | A status other than 200; `:error` for 5xx. |
+| `:set_cookie`, `:private`, `:vary`, `:encoded` | The response had `Set-Cookie`, `Cache-Control: private` or `no-store`, `Vary` other than `Accept-Encoding`, or `Content-Encoding`. |
+| `:too_large` | The body passed `max_entry_bytes`, or body and headers together passed `max_bytes`. |
+| `:aborted` | The response stopped part-way. |
+| `:unavailable` | No response from Node, such as a 503 from admission. |
+| `:invalidated` | An invalidation ran while the page rendered. |
 
 ### OpenTelemetry
 

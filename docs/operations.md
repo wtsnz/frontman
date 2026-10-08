@@ -12,7 +12,8 @@ Frontman.status(MyApp.SSR)
 #   capacity: 32,
 #   max_concurrency: 16,
 #   workers: [%{index: 1, port: 41231, node_pid: 9120, pid: #PID<0.812.0>, in_flight: 2, state: :ready}, ...],
-#   slots: [%{index: 1, phase: :ready, port: 41231, node_pid: 9120, failures: 0, restart_attempt: 0, next_delay: nil}, ...]
+#   slots: [%{index: 1, phase: :ready, port: 41231, node_pid: 9120, failures: 0, restart_attempt: 0, next_delay: nil}, ...],
+#   cache: %{entries: 412, bytes: 18_204_112, max_entries: 10_000, max_bytes: 64_000_000, hits: 90_211, misses: 1_532, ...}
 # }
 ```
 
@@ -20,6 +21,24 @@ Frontman.status(MyApp.SSR)
 including ones that are starting, backing off or stuck in `cleanup_failed`. When a worker is
 missing from `workers`, look at its slot. `status/1` returns `nil` while the pool is stopped or
 starting.
+
+`cache` is `nil` for a pool without a page cache.
+
+## Page cache
+
+A node starts with an empty cache, so a deploy serves pages built by the new release. Expect a
+burst of misses after each start. Each page renders once, however many requests arrive for it.
+
+Size it from the pages you mark. `bytes` in `status/1` divided by `entries` is the average stored
+page. Without `max-age`, a page stays until invalidated or evicted, so invalidate when the data
+behind it changes. Invalidation is local to the node; see the
+[README](../README.md#invalidate) for broadcasting it.
+
+From a remote console:
+
+```elixir
+Frontman.invalidate(MyApp.SSR, prefix: "/")   # empty this node's cache
+```
 
 ## Deploy with a drain
 
@@ -76,6 +95,8 @@ seconds. Requests still going after that are cut off.
 | `workers` | 1 | One per CPU is a reasonable start. Each worker is a full Node process, so memory sets the ceiling. |
 | `max_concurrency` | 16 | Per worker. Past this, requests get 503 rather than queueing. Measure under your own SSR load. |
 | `health_check_timeout` | 500 ms | Raise it if your event loop has long synchronous stretches during SSR. |
+| `cache` `max_entries`, `max_bytes` | 10,000, 64 MB | Per node, in the BEAM's memory. Raise them if `evicted` climbs while the same pages keep missing. |
+| `cache` `query` | `:all` | Leave tracking parameters out with `{:except, names}`, so links from campaigns share one entry. |
 | `health_check_failures` | 3 | With the defaults, a hung worker stops getting requests within about 2.5 s, and Frontman starts replacing it within about 7.5 s. |
 
 The full list is in [Reference](reference.md#pool-options). None of the defaults come from load
@@ -97,6 +118,9 @@ alert on:
 | `[:frontman, :worker, :unhealthy]` | Probe failures. Frequent ones without restarts suggest a slow event loop |
 | `[:frontman, :worker, :cleanup_failed]` | Always alert. That slot serves nothing until the worker restarts |
 | `[:frontman, :request, :stop]` `duration` | SSR latency as seen by Phoenix, including streaming |
+| `[:frontman, :cache, :hit]` against `:miss` | The share of marked pages served from memory |
+| `[:frontman, :cache, :skip]` by `reason` | `:not_marked` is normal for personal pages. `:set_cookie`, `:private` or `:invalid_marker` on a page you marked means it isn't being cached. |
+| `[:frontman, :cache, :evict]` | Steady eviction means the cache is too small for the pages you mark, or clients are making up query strings |
 
 The proxy also opens a `frontend.proxy` OpenTelemetry span for each attempt, with the worker
 index and response status. Frontman depends only on the OpenTelemetry API. Configure the SDK and
@@ -114,6 +138,8 @@ Node's stdout and stderr go to Logger at `:info`, prefixed with `frontend[N]`.
 | Every worker is busy | 503 with `Retry-After: 2` | Nothing to recover. Admission resumes as requests finish. |
 | A registry, Finch pool or admission server crashes | 503 for pages briefly | `rest_for_one` restarts it and every worker after it |
 | Node won't exit | That slot stays empty | `cleanup_failed`. No replacement until the worker process restarts |
+| No worker is ready, or the pool is draining | Cached pages, including stale ones within `stale-while-revalidate`, keep working. Misses get 503. | Refreshes fail and are retried a second later |
+| The cache server crashes | Every page misses once | Restarts empty. Node and in-flight requests are unaffected. |
 
 ## Limits
 
@@ -129,3 +155,6 @@ Node's stdout and stderr go to Logger at `:info`, prefixed with `frontend[N]`.
   so Node's own children, or Node itself after the wrapper is killed, can be orphaned.
 - Phoenix is on the page path. If Phoenix is down, pages are down.
 - Drain isn't wired into any deploy tool. Your deploy script calls it.
+- The page cache is in memory on each node. Nodes don't share pages or invalidations.
+- A page larger than `max_entry_bytes`, or a request with a made-up query string, still costs
+  a render each time. Leave unknown parameters out of the key with the `query` option.

@@ -15,6 +15,13 @@ const server = http.createServer((request, response) => {
     response.end('freezing');
     // Fault fixture: the registered SIGTERM handler cannot run while JS blocks the event loop.
     setTimeout(() => { while (true) {} }, 20);
+  } else if (request.url.startsWith('/cached')) {
+    // Marked cacheable. Each render's body is unique, so a repeat shows a cache hit.
+    const send = () => {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'x-frontman-cache': 'public' });
+      response.end(`${process.env.APP_LABEL} ${process.pid} ${process.hrtime.bigint()}`);
+    };
+    request.url.startsWith('/cached-slow') ? setTimeout(send, 300) : send();
   } else if (request.url === '/backend-down') {
     response.writeHead(503);
     response.end('Database unavailable');

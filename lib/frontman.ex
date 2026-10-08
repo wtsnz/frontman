@@ -15,6 +15,9 @@ defmodule Frontman do
   def states(name), do: Module.concat(name, States)
 
   @doc false
+  def cache(name), do: Module.concat(name, Cache)
+
+  @doc false
   def slots(name) do
     states(name)
     |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [:"$3"]}])
@@ -40,7 +43,7 @@ defmodule Frontman do
   @doc "Ready-registered workers, including in-flight counts and ready/draining state."
   def workers(name), do: call(admission(name), :workers, [])
 
-  @doc "Pool admission state and capacity, or nil while unavailable."
+  @doc "Pool admission state, capacity and cache counters, or nil while unavailable."
   def status(name), do: call(admission(name), :status, nil)
 
   @doc "Reserves one request slot, owned by the calling process. No capacity queue is used."
@@ -64,6 +67,12 @@ defmodule Frontman do
 
   @doc "Reopens admission after drain has completed or timed out."
   def resume(name), do: call(admission(name), :resume, {:error, :unavailable})
+
+  @doc """
+  Removes cached pages on this node only: every query variant of `path`, or of every path
+  starting with `prefix`, optionally limited to one `host`. Returns `{:ok, removed}`.
+  """
+  def invalidate(name, opts), do: Frontman.Cache.invalidate(name, opts)
 
   @doc "Drains, then stops a directly started runtime, even when draining times out."
   def stop(name, opts \\ []) do

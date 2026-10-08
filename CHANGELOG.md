@@ -17,3 +17,7 @@ Initial extraction from a Phoenix, Ash and TanStack Start application. Experimen
 - `mix frontman.package`: builds the frontend with a pinned Node, verified against Node's published
   SHA-256 and cached between runs, and copies the `node` binary and the build into `priv` for the
   release. Configured through `config :frontman, :package`.
+- Opt-in page cache: the pool's `cache` option stores responses Node marks with `x-frontman-cache`,
+  keyed on host, path and query string. Concurrent misses render once, with optional
+  stale-while-revalidate, ETag and `304` answers, `Frontman.invalidate/2`, size bounds, telemetry
+  and counters in `Frontman.status/1`. Pools with `port` ignore it. Off unless configured.

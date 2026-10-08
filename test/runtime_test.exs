@@ -102,6 +102,25 @@ defmodule Frontman.RuntimeTest do
     eventually(fn -> not alive?(second.node_pid) end)
   end
 
+  test "a cached page is served while Node is down, and the cache goes with the pool" do
+    start_supervised!({Frontman, options(CachedPool, 1, "cached") ++ [cache: []]})
+    eventually(fn -> length(Frontman.workers(CachedPool)) == 1 end)
+    [worker] = Frontman.workers(CachedPool)
+
+    first = proxy(CachedPool, "/cached")
+    assert first.status == 200
+    eventually(fn -> Frontman.status(CachedPool).cache.entries == 1 end)
+
+    assert {_, 0} = System.cmd("kill", ["-KILL", to_string(worker.node_pid)])
+    eventually(fn -> Frontman.workers(CachedPool) == [] end)
+    assert %{status: 200, resp_body: body} = proxy(CachedPool, "/cached")
+    assert body == first.resp_body
+    assert proxy(CachedPool, "/cached?other").status == 503
+
+    stop_supervised!(CachedPool)
+    assert Frontman.Cache.stats(CachedPool) == nil
+  end
+
   test "rebuilds worker registration when the registry crashes" do
     start_supervised!({Frontman, options(RegistryPool, 1, "registry")})
     eventually(fn -> length(Frontman.workers(RegistryPool)) == 1 end)

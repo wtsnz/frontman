@@ -60,7 +60,8 @@ defmodule Frontman.Admission do
        max_concurrency: state.limit,
        capacity: length(workers) * state.limit,
        workers: workers,
-       slots: Frontman.slots(state.name)
+       slots: Frontman.slots(state.name),
+       cache: Frontman.Cache.stats(state.name)
      }, state}
   end
 

@@ -18,6 +18,7 @@ flowchart TD
     Sup --> Tasks["Task.Supervisor<br/><i>MyApp.SSR.Tasks</i><br/>probe and cleanup tasks"]
     Sup --> Adm["Frontman.Admission<br/><i>MyApp.SSR.Admission</i><br/>request slots"]
     Sup --> Pool["Frontman.PoolSupervisor<br/>one_for_one"]
+    Sup --> Cache["Frontman.Cache<br/><i>MyApp.SSR.Cache</i><br/>only with the cache option"]
     Pool --> W1["Frontman.Worker 1"]
     Pool --> W2["Frontman.Worker 2"]
     W1 --> D1["MuonTrap.Daemon"] --> M1["muontrap wrapper"] --> N1["node"]
@@ -27,6 +28,9 @@ flowchart TD
 The top supervisor is `rest_for_one`, and the workers come last. If a registry, Finch pool,
 task supervisor or the admission server crashes, everything after it restarts, including the
 workers. That keeps workers from holding references to processes that no longer exist.
+
+The page cache, when configured, comes after the workers. If it crashes, it restarts empty
+and Node keeps running. On shutdown it stops first, and requests waiting on it go to the workers.
 
 Workers sit in their own `one_for_one` supervisor, so one worker crashing doesn't touch the
 others. That supervisor has a shared restart budget of five times the configured worker count
@@ -117,6 +121,78 @@ A failed attempt retries on another worker only when that's safe:
 
 Each retry excludes the workers that already failed, so a request tries each worker at most
 once.
+
+## Page cache
+
+The cache is one GenServer per pool and three ETS tables: pages, pages known to be uncacheable,
+and the pool's cache settings. Request processes read the tables directly, so a hit never
+calls the server. The server makes every change to what's stored, and decides who renders a
+missing page.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R1 as Request 1
+    participant R2 as Requests 2..n
+    participant E as ETS
+    participant C as Cache server
+    participant A as Admission
+    participant W as Node worker
+
+    R1->>E: lookup key
+    E-->>R1: none
+    R1->>C: claim
+    C-->>R1: lead the render
+    R2->>E: lookup key
+    E-->>R2: none
+    R2->>C: claim (waits, holding no slot)
+    R1->>A: checkout
+    R1->>W: GET, without If-None-Match
+    W-->>R1: 200, x-frontman-cache: public
+    R1-->>R1: stream to its client, keep a copy
+    R1->>C: complete with the page
+    C->>E: store, evict if over a bound
+    C-->>R2: the page
+    Note over R2: answered from memory
+```
+
+If the response can't be stored, request 1 tells the server as soon as it knows, usually at the
+headers. The waiters then render their own pages through admission, as uncached requests do.
+The key is also remembered as uncacheable, so later misses on it go straight to Node instead of
+waiting.
+
+A leader that crashes is caught by a monitor, and so is each waiter, so one that leaves is
+dropped at once. After 15 seconds the server lets the waiters go and takes no more for that
+render, so a stuck render can't hold a page hostage. Past 1,000 waiters on one page, further
+requests render through admission instead.
+
+### Freshness
+
+Each page records when it was stored. Within `max-age` it's a hit. Within
+`stale-while-revalidate` after that, it's served stale and the request asks the server for a
+refresh. The server starts one task per page under the pool's task supervisor. The task checks
+out a slot like any request, renders without the visitor's cookies, and stores the result. A
+refresh that gets a 5xx, a 503 from admission or a broken response leaves the stale copy in
+place and allows another try a second later. A refresh that returns a page that can't be stored
+removes it.
+
+### Invalidation
+
+`Frontman.invalidate/2` runs in the server. It removes the matching pages and increments a
+counter. Every render records the counter, and a reference unique to the running cache, when it
+starts. The server ignores a finished render whose counter or reference is out of date. So a
+render that read old data before an invalidation can't store it afterwards, even if the cache
+restarted in between.
+
+### Admission and drain
+
+Only requests that go to Node take a slot: a leader, a refresh, a waiter that falls back, and
+every request for an uncacheable page. Hits and waiters don't. A full pool therefore still
+answers hits, and waiters can't exceed `max_concurrency`, because the ones that fall back
+check out a slot like any other request.
+
+During a drain, hits are served and misses get 503s. A leader that already holds a slot finishes,
+and the drain waits for it as usual.
 
 ## Worker lifecycle
 
@@ -230,5 +306,5 @@ sequenceDiagram
     Note over A: mode = :ready
 ```
 
-Drain doesn't stop Node, cancel requests, or touch backend routes and assets. A worker that
+Drain doesn't stop Node, cancel requests, or touch backend routes, assets or cached pages. A worker that
 restarts during a drain comes back into a closed pool.

@@ -561,3 +561,30 @@ to drain connections on SIGTERM.
 
 Read [Operations](operations.md) before your first deploy. It covers draining the pool during a
 cutover and the telemetry worth alerting on.
+
+## 10. Cache public pages (optional)
+
+Pages that are the same for every visitor, such as a marketing site, can be rendered once per
+node and served from memory. Configure the cache only where the release runs:
+
+```elixir
+# config/runtime.exs, inside the prod block
+config :my_app, :frontend,
+  cache: [query: {:except, ["utm_source", "utm_medium", "utm_campaign", "gclid", "fbclid"]}]
+```
+
+```elixir
+# MyApp.FrontendPool.start_link/1
+Frontman.start_link(
+  name: MyApp.SSR,
+  # ...
+  cache: config[:cache]
+)
+```
+
+Then mark routes with the `cacheable` helper from the [README](../README.md#mark-a-tanstack-start-route).
+Before you mark one, check every loader in its route tree, starting with the root. A root loader
+that reads the session puts the first visitor's account in the cached page. Load the session on
+the client for cacheable routes.
+
+A development pool with `port` ignores `cache`, so Vite keeps serving every request.
