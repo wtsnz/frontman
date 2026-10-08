@@ -4,7 +4,8 @@ defmodule Frontman.Proxy do
 
   Phoenix owns every public request. Backend paths continue to the router; everything else is
   streamed to the least busy ready worker. The proxy runs before `Plug.Parsers`, so server
-  function bodies reach Node unchanged.
+  function bodies reach Node unchanged. When the pool has a `cache`, pages Node marked
+  cacheable are served from memory; see the README's page cache section.
   """
   @behaviour Plug
 
@@ -13,6 +14,7 @@ defmodule Frontman.Proxy do
   require OpenTelemetry.Tracer, as: Tracer
 
   alias Frontman, as: Frontend
+  alias Frontman.Cache
 
   @hop_by_hop ~w(connection keep-alive proxy-authenticate proxy-authorization proxy-connection
                  te trailer transfer-encoding upgrade)
@@ -40,8 +42,64 @@ defmodule Frontman.Proxy do
         conn |> send_resp(404, "") |> halt()
 
       true ->
-        conn |> proxy() |> halt()
+        conn |> serve() |> halt()
     end
+  end
+
+  # Without a configured cache this is `proxy/1`, unchanged.
+  defp serve(conn) do
+    case Cache.lookup(Keyword.fetch!(conn.private.frontman, :name), conn) do
+      :disabled ->
+        proxy(conn)
+
+      {:hit, entry} ->
+        send_cached(conn, entry, "hit")
+
+      {:stale, entry, refresh?, ctx} ->
+        if refresh?, do: Cache.refresh(ctx, refresh_spec(conn))
+        send_cached(conn, entry, "stale")
+
+      {:miss, ctx} ->
+        case Cache.claim(ctx) do
+          {:entry, entry} -> send_cached(conn, entry, "hit")
+          {:leader, ctx} -> render(conn, ctx)
+          :render -> render(conn, ctx)
+        end
+
+      {kind, ctx} when kind in [:render, :bypass] ->
+        render(conn, ctx)
+    end
+  end
+
+  # Proxies as usual, capturing the response, then reports how it went. A leader that never
+  # reports would leave its waiters to time out.
+  defp render(conn, ctx) do
+    conn = conn |> put_private(:frontman_cache, ctx) |> proxy()
+    Cache.finish(ctx, conn.private[:frontman_cache_outcome])
+    conn
+  catch
+    kind, reason ->
+      Cache.finish(ctx, {:skip, :aborted})
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp send_cached(conn, entry, label) do
+    {status, headers, body} = Cache.response(conn, entry, label)
+    request_id = Enum.filter(conn.resp_headers, &(elem(&1, 0) == "x-request-id"))
+    # The adapter drops the body for HEAD but keeps its length.
+    send_resp(%{conn | resp_headers: request_id ++ headers}, status, body)
+  end
+
+  # A background refresh renders as an anonymous visitor: no cookies, credentials or validators.
+  defp refresh_spec(conn) do
+    headers =
+      conn
+      |> request_headers()
+      |> Enum.reject(fn {name, _value} ->
+        name in ["cookie", "authorization", "if-none-match", "if-modified-since"]
+      end)
+
+    %{path: conn.request_path <> query(conn), headers: headers}
   end
 
   defp backend_path?(path, opts),
@@ -127,7 +185,7 @@ defmodule Frontman.Proxy do
       |> request(worker, body)
       |> Finch.stream_while(
         Frontend.finch(Keyword.fetch!(conn.private.frontman, :name)),
-        %{conn: conn, sent: false},
+        %{conn: conn, sent: false, cache: Cache.capture(conn.private[:frontman_cache])},
         &relay/2,
         pool_timeout: 2_000,
         receive_timeout: 15_000
@@ -137,10 +195,12 @@ defmodule Frontman.Proxy do
   end
 
   defp request(conn, worker, body) do
-    query = if conn.query_string == "", do: "", else: "?" <> conn.query_string
-    url = "http://127.0.0.1:#{worker.port}#{conn.request_path}#{query}"
+    url = "http://127.0.0.1:#{worker.port}#{conn.request_path}#{query(conn)}"
     Finch.build(conn.method, url, :otel_propagator_text_map.inject(request_headers(conn)), body)
   end
+
+  defp query(%{query_string: ""}), do: ""
+  defp query(conn), do: "?" <> conn.query_string
 
   defp request_headers(conn) do
     forwarded_for =
@@ -157,7 +217,14 @@ defmodule Frontman.Proxy do
     # The Host header keeps a non-default port, which `conn.host` drops. The frontend needs it
     # to rebuild the public origin, for example `localhost:4000` in development.
     |> put_default("x-forwarded-host", conn |> get_req_header("host") |> List.first(conn.host))
+    |> drop_validators(conn)
   end
+
+  # A cache fill needs Node's full page, not a 304 meant for one client.
+  defp drop_validators(headers, %{method: "GET", private: %{frontman_cache: _ctx}}),
+    do: Enum.reject(headers, &(elem(&1, 0) in ["if-none-match", "if-modified-since"]))
+
+  defp drop_validators(headers, _conn), do: headers
 
   defp put_default(headers, name, value) do
     if List.keymember?(headers, name, 0), do: headers, else: headers ++ [{name, value}]
@@ -179,8 +246,10 @@ defmodule Frontman.Proxy do
 
   defp relay({:headers, headers}, %{sent: false, conn: conn} = acc) do
     headers = Enum.reject(headers, fn {name, _} -> name in ["content-length" | @hop_by_hop] end)
+    {cache, headers} = Cache.capture_headers(acc.cache, conn.method, acc.status, headers)
     request_id = Enum.filter(conn.resp_headers, &(elem(&1, 0) == "x-request-id"))
     conn = %{conn | resp_headers: request_id ++ headers}
+    acc = %{acc | cache: cache}
 
     if bodiless?(conn.method, acc.status) do
       {:cont, %{acc | conn: conn}}
@@ -195,9 +264,9 @@ defmodule Frontman.Proxy do
 
   defp relay({:data, data}, %{sent: true} = acc) do
     case chunk(acc.conn, data) do
-      {:ok, conn} -> {:cont, %{acc | conn: conn}}
+      {:ok, conn} -> {:cont, %{acc | conn: conn, cache: Cache.capture_data(acc.cache, data)}}
       # The browser went away; halting also cancels the upstream request.
-      {:error, _reason} -> {:halt, acc}
+      {:error, _reason} -> {:halt, %{acc | cache: Cache.abort(acc.cache)}}
     end
   end
 
@@ -205,10 +274,11 @@ defmodule Frontman.Proxy do
 
   defp bodiless?(method, status), do: method == "HEAD" or status in [204, 304] or status < 200
 
-  defp finish({:ok, %{sent: true, conn: conn}}, _conn, _body, _excluded), do: conn
+  defp finish({:ok, %{sent: true, conn: conn} = acc}, _conn, _body, _excluded),
+    do: settle(conn, acc.cache, true)
 
-  defp finish({:ok, %{conn: conn, status: status}}, _conn, _body, _excluded),
-    do: send_resp(conn, status, "")
+  defp finish({:ok, %{conn: conn, status: status} = acc}, _conn, _body, _excluded),
+    do: conn |> settle(acc.cache, true) |> send_resp(status, "")
 
   defp finish({:error, error, %{sent: false}}, conn, body, excluded) do
     if retryable?(error, conn.method) do
@@ -219,10 +289,16 @@ defmodule Frontman.Proxy do
     end
   end
 
-  defp finish({:error, error, %{sent: true, conn: sent}}, _conn, _body, _excluded) do
+  defp finish({:error, error, %{sent: true, conn: sent} = acc}, _conn, _body, _excluded) do
     Logger.warning("frontend proxy failed mid-response: #{Exception.message(error)}")
-    sent
+    settle(sent, acc.cache, false)
   end
+
+  # Records what the cache can do with the response, for `render/2` to report.
+  defp settle(conn, nil, _complete?), do: conn
+
+  defp settle(conn, cache, complete?),
+    do: put_private(conn, :frontman_cache_outcome, Cache.outcome(cache, complete?))
 
   # A refused connection never reached Node, so any method can move to another worker. A closed
   # connection may have delivered the request, so only safe methods retry. Each attempt excludes

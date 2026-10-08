@@ -1,6 +1,7 @@
 defmodule Frontman.Supervisor do
   @moduledoc false
   use Supervisor
+  require Logger
 
   def start_link(opts) do
     Supervisor.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
@@ -22,8 +23,28 @@ defmodule Frontman.Supervisor do
     ]
 
     # Rebuild workers if their registry or HTTP client is lost. Individual worker crashes
-    # remain isolated inside PoolSupervisor.
-    Supervisor.init(children, strategy: :rest_for_one)
+    # remain isolated inside PoolSupervisor. The cache comes last, so losing it never restarts
+    # Node, and on shutdown it stops first, sending its waiters back to the workers.
+    Supervisor.init(children ++ cache(name, opts), strategy: :rest_for_one)
+  end
+
+  defp cache(name, opts) do
+    case Keyword.get(opts, :cache) do
+      off when off in [nil, false] ->
+        []
+
+      cache ->
+        config = Frontman.Cache.config!(cache)
+
+        # An external server is how Phoenix fronts the Vite dev server. Caching there would
+        # serve old modules and pages over live edits.
+        if Keyword.has_key?(opts, :port) do
+          Logger.warning("Frontman pool #{inspect(name)} ignores cache: it proxies to port")
+          []
+        else
+          [{Frontman.Cache, name: name, config: config}]
+        end
+    end
   end
 
   # With `port`, the server runs outside Frontman and only its address is registered.
