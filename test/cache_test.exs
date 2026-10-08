@@ -364,6 +364,32 @@ defmodule Frontman.CacheTest do
       assert Enum.all?(Task.await_many(waiters), &(&1.status == 200))
     end
 
+    test "a waiter that leaves is forgotten before the render finishes" do
+      leader = Task.async(fn -> get("/hold") end)
+      node = held()
+      waiters = for _ <- 1..3, do: Task.async(fn -> get("/hold") end)
+      eventually(fn -> waiting("/hold") end, &(&1 == 3))
+
+      Enum.each(waiters, &Task.shutdown(&1, :brutal_kill))
+      eventually(fn -> waiting("/hold") end, &(&1 == 0))
+      send(node, :release)
+      assert Task.await(leader).status == 200
+    end
+
+    test "past 1,000 waiters on one page, more requests go to Node" do
+      leader = Task.async(fn -> get("/hold") end)
+      node = held()
+      waiters = for _ <- 1..1_000, do: Task.async(fn -> get("/hold") end)
+      eventually(fn -> waiting("/hold") end, &(&1 == 1_000))
+
+      extra = Task.async(fn -> get("/hold") end)
+      send(held(), :release)
+      assert Task.await(extra).status == 200
+      send(node, :release)
+      assert Task.await(leader).status == 200
+      assert Enum.all?(Task.await_many(waiters, 10_000), &(&1.status == 200))
+    end
+
     @tag max_concurrency: 1
     test "waiters don't bypass admission: a rejected leader sends them to the 503 path" do
       {:ok, lease} = Frontman.checkout(@pool)
@@ -518,6 +544,28 @@ defmodule Frontman.CacheTest do
     assert byte_size(get("/sized?n=1000").resp_body) == 1_000
     assert_receive {:telemetry, :skip, _, %{reason: :too_large}}
     assert %{entries: 0, bytes: 0} = stats()
+    # Like any page that can't be stored, it's remembered, so later misses don't wait on it.
+    assert :ets.member(
+             Module.concat(@pool, CachePasses),
+             {"http", "www.example.com", "/sized", "n=1000"}
+           )
+  end
+
+  test "a refresh result for a copy that has since been replaced changes nothing" do
+    get("/page")
+    key = {"http", "www.example.com", "/page", ""}
+    %{epoch: {generation, counter}} = :sys.get_state(Frontman.cache(@pool))
+    epoch = {generation, :atomics.get(counter, 1)}
+
+    # A refresh of some earlier copy comes back uncacheable after this copy was stored.
+    GenServer.cast(
+      Frontman.cache(@pool),
+      {:complete, key, make_ref(), {:skip, :not_marked}, epoch, make_ref()}
+    )
+
+    assert stats().entries == 1
+    refute :ets.member(Module.concat(@pool, CachePasses), key)
+    assert header(get("/page"), "x-frontman-cache-status") == "hit"
   end
 
   test "a late refresh request for a page that is fresh again starts nothing" do
@@ -646,6 +694,14 @@ defmodule Frontman.CacheTest do
       {:holding, pid} -> pid
     after
       1_000 -> flunk("no request reached the upstream")
+    end
+  end
+
+  # Requests currently waiting on another request's render of `path`.
+  defp waiting(path) do
+    case :sys.get_state(Frontman.cache(@pool)).flights do
+      %{{"http", "www.example.com", ^path, ""} => flight} -> map_size(flight.waiters)
+      _none -> 0
     end
   end
 

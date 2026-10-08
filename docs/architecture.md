@@ -161,8 +161,10 @@ headers. The waiters then render their own pages through admission, as uncached 
 The key is also remembered as uncacheable, so later misses on it go straight to Node instead of
 waiting.
 
-A leader that crashes is caught by a monitor. A waiter gives up after 15 seconds, and a render
-older than that stops collecting waiters, so a stuck render can't hold a page hostage.
+A leader that crashes is caught by a monitor, and so is each waiter, so one that leaves is
+dropped at once. After 15 seconds the server lets the waiters go and takes no more for that
+render, so a stuck render can't hold a page hostage. Past 1,000 waiters on one page, further
+requests render through admission instead.
 
 ### Freshness
 

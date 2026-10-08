@@ -305,7 +305,7 @@ end
 ### Under load
 
 When many requests miss the same page at once, one goes to Node and the rest wait for it, for
-up to 15 seconds. Waiting requests hold no admission slot. If the page turns out cacheable they
+up to 15 seconds and up to 1,000 per page. Waiting requests hold no admission slot. If the page turns out cacheable they
 share it; if not, each renders its own through normal admission, and gets a 503 when the pool
 is full. Hits don't need a slot at all, so they're served during a drain and while no worker
 is ready.

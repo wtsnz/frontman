@@ -14,6 +14,8 @@ defmodule Frontman.Cache do
   # A waiter gives up and renders for itself after this long, matching the proxy's receive
   # timeout. A refresh in flight blocks further refreshes for the same time.
   @wait 15_000
+  # Requests waiting on one render. Past this, more go to Node through admission.
+  @max_waiters 1_000
   # After a refresh fails, stale hits wait this long before starting another.
   @retry 1_000
   # Last-use times are only rewritten once per interval, so a hot page isn't a hot ETS row.
@@ -363,6 +365,8 @@ defmodule Frontman.Cache do
       end
 
     %{
+      # Tells this copy from a later one stored under the same key.
+      id: make_ref(),
       headers: headers,
       body: body,
       etag: etag,
@@ -580,11 +584,15 @@ defmodule Frontman.Cache do
   def handle_call({:claim, key}, {pid, _tag} = from, state) do
     case state.flights do
       %{^key => flight} ->
-        # A render that has outlived the wait can't help anyone arriving now.
-        if now() - flight.started > @wait,
-          do: {:reply, :render, state},
-          else:
-            {:noreply, put_in(state.flights[key], %{flight | waiters: [from | flight.waiters]})}
+        # A render past the wait can't help anyone arriving now, and a full queue sends the
+        # caller to admission like any other request.
+        if flight.closed or map_size(flight.waiters) >= @max_waiters do
+          {:reply, :render, state}
+        else
+          ref = Process.monitor(pid)
+          state = put_in(state.flights[key].waiters[ref], from)
+          {:noreply, put_in(state.monitors[ref], {:waiter, key})}
+        end
 
       _none ->
         case servable(state, key) do
@@ -627,8 +635,7 @@ defmodule Frontman.Cache do
   @impl true
   def handle_cast({:release, key, token}, state) do
     {flight, state} = end_flight(state, key, token)
-    reply_all(flight, :render)
-    {:noreply, state}
+    {:noreply, reply_all(state, flight, :render)}
   end
 
   def handle_cast({:complete, key, token, outcome, epoch, refresh}, state) do
@@ -639,22 +646,19 @@ defmodule Frontman.Cache do
         # Rendered before an invalidation, or under a cache this one replaced: it may not
         # change anything, stored page or pass mark.
         epoch != current_epoch(state) ->
-          reply_all(flight, :render)
-
           if match?({:store, _}, outcome),
             do: emit(state, :skip, %{}, Map.put(key_meta(key), :reason, :invalidated))
 
-          state
-
-        match?({:store, _}, outcome) ->
-          {:store, entry} = outcome
-          reply_all(flight, {:entry, entry})
-          store(state, key, entry)
+          reply_all(state, flight, :render)
 
         true ->
-          {:skip, reason} = outcome
-          reply_all(flight, :render)
-          skipped(state, key, reason, refresh)
+          case fit(state, key, outcome) do
+            {:store, entry} ->
+              state |> reply_all(flight, {:entry, entry}) |> store(key, entry)
+
+            {:skip, reason} ->
+              state |> reply_all(flight, :render) |> skipped(key, reason, refresh)
+          end
       end
 
     {:noreply, state}
@@ -662,7 +666,7 @@ defmodule Frontman.Cache do
 
   def handle_cast({:refresh, key, spec}, state) do
     case refreshable(state, key) do
-      {:ok, stored_at} -> {:noreply, start_refresh(state, key, spec, stored_at)}
+      {:ok, copy} -> {:noreply, start_refresh(state, key, spec, copy)}
       :error -> {:noreply, state}
     end
   end
@@ -677,13 +681,13 @@ defmodule Frontman.Cache do
            :ets.lookup(table(state.name, :entries), key),
          age = now - entry.stored_at,
          true <- not fresh?(entry, age) and servable?(entry, age) and refresh_at <= now do
-      {:ok, entry.stored_at}
+      {:ok, entry.id}
     else
       _no -> :error
     end
   end
 
-  defp start_refresh(state, key, spec, stored_at) do
+  defp start_refresh(state, key, spec, copy) do
     entries = table(state.name, :entries)
     token = make_ref()
 
@@ -695,12 +699,12 @@ defmodule Frontman.Cache do
       key: key,
       token: token,
       # The copy being refreshed, so a late result can't remove a newer one.
-      refresh: stored_at
+      refresh: copy
     }
 
     with true <- :ets.update_element(entries, key, {4, now() + @wait}),
          {:ok, pid} <- start_task(state.name, fn -> refresh_render(ctx, spec) end) do
-      start_flight(state, key, pid, token, stored_at)
+      start_flight(state, key, pid, token, copy)
     else
       _failed -> state
     end
@@ -712,21 +716,34 @@ defmodule Frontman.Cache do
       {nil, _monitors} ->
         {:noreply, state}
 
+      # A waiter left. Forget it, so a long render doesn't keep the dead caller.
+      {{:waiter, key}, monitors} ->
+        state = %{state | monitors: monitors}
+
+        case state.flights do
+          %{^key => flight} ->
+            {:noreply,
+             put_in(state.flights[key], %{flight | waiters: Map.delete(flight.waiters, ref)})}
+
+          _ended ->
+            {:noreply, state}
+        end
+
       {key, monitors} ->
         {flight, flights} = Map.pop(state.flights, key)
-        reply_all(flight, :render)
         if flight.refresh, do: retry_later(state, key, flight.refresh)
-        {:noreply, %{state | flights: flights, monitors: monitors}}
+        state = %{state | flights: flights, monitors: monitors}
+        {:noreply, reply_all(state, flight, :render)}
     end
   end
 
-  # Waiters give up after @wait on their side. Let go of them here too, so a slow render
-  # doesn't hold on to callers that have left. The render itself can still store its page.
+  # Waiters give up after @wait on their side. Let go of them here too, and take no more, so a
+  # slow render doesn't collect callers. The render itself can still store its page.
   def handle_info({:expire, key, token}, state) do
     case state.flights do
       %{^key => %{token: ^token} = flight} ->
-        reply_all(flight, :render)
-        {:noreply, put_in(state.flights[key], %{flight | waiters: []})}
+        state = reply_all(state, flight, :render)
+        {:noreply, put_in(state.flights[key], %{flight | waiters: %{}, closed: true})}
 
       _other ->
         {:noreply, state}
@@ -742,7 +759,7 @@ defmodule Frontman.Cache do
   defp start_flight(state, key, pid, token, refresh) do
     ref = Process.monitor(pid)
     Process.send_after(self(), {:expire, key, token}, @wait)
-    flight = %{token: token, monitor: ref, waiters: [], refresh: refresh, started: now()}
+    flight = %{token: token, monitor: ref, waiters: %{}, refresh: refresh, closed: false}
 
     %{
       state
@@ -768,8 +785,16 @@ defmodule Frontman.Cache do
     end
   end
 
-  defp reply_all(nil, _message), do: :ok
-  defp reply_all(flight, message), do: Enum.each(flight.waiters, &GenServer.reply(&1, message))
+  defp reply_all(state, nil, _message), do: state
+
+  defp reply_all(state, flight, message) do
+    Enum.each(flight.waiters, fn {ref, from} ->
+      Process.demonitor(ref, [:flush])
+      GenServer.reply(from, message)
+    end)
+
+    %{state | monitors: Map.drop(state.monitors, Map.keys(flight.waiters))}
+  end
 
   defp servable(state, key) do
     case :ets.lookup(table(state.name, :entries), key) do
@@ -781,47 +806,52 @@ defmodule Frontman.Cache do
     end
   end
 
+  # Headers count towards max_bytes too, so a body under max_entry_bytes can still be too big.
+  defp fit(state, key, {:store, %{bytes: bytes}}) when bytes > state.config.max_bytes do
+    emit(state, :skip, %{}, Map.put(key_meta(key), :reason, :too_large))
+    {:skip, :too_large}
+  end
+
+  defp fit(_state, _key, outcome), do: outcome
+
   defp skipped(state, key, reason, refresh) when reason in @inconclusive do
     if refresh, do: retry_later(state, key, refresh)
     state
   end
 
-  defp skipped(state, key, _reason, refresh) do
+  # A refresh of a copy that has since been replaced says nothing about the page now stored.
+  defp skipped(state, key, _reason, refresh) when refresh != false do
+    if copy(state, key) == refresh, do: state |> pass(key) |> delete(key), else: state
+  end
+
+  # A visitor's render only replaces a copy that can't be served any more.
+  defp skipped(state, key, _reason, false) do
+    state = pass(state, key)
+    if servable(state, key) == :error, do: delete(state, key), else: state
+  end
+
+  defp pass(state, key) do
     passes = table(state.name, :passes)
     # Bounded without bookkeeping: past the entry limit, forget every pass at once.
     if :ets.info(passes, :size) >= state.config.max_entries, do: :ets.delete_all_objects(passes)
     :ets.insert(passes, {key})
-
-    # A refresh that isn't cacheable means the page no longer is, if the copy it refreshed is
-    # still the one stored. A visitor's render only replaces a copy that can't be served.
-    cond do
-      refresh -> if stored_at(state, key) == refresh, do: delete(state, key), else: state
-      servable(state, key) == :error -> delete(state, key)
-      true -> state
-    end
+    state
   end
 
-  defp retry_later(state, key, stored_at) do
-    if stored_at(state, key) == stored_at,
+  defp retry_later(state, key, copy) do
+    if copy(state, key) == copy,
       do: :ets.update_element(table(state.name, :entries), key, {4, now() + @retry})
   end
 
-  defp stored_at(state, key) do
+  defp copy(state, key) do
     case :ets.lookup(table(state.name, :entries), key) do
-      [{^key, entry, _used, _refresh_at, _bytes}] -> entry.stored_at
+      [{^key, entry, _used, _refresh_at, _bytes}] -> entry.id
       [] -> nil
     end
   end
 
   defp current_epoch(%{epoch: {generation, counter}}),
     do: {generation, :atomics.get(counter, 1)}
-
-  # Headers count towards the bound too, so a body just under max_entry_bytes can still be
-  # too big to keep.
-  defp store(state, key, %{bytes: bytes}) when bytes > state.config.max_bytes do
-    emit(state, :skip, %{}, Map.put(key_meta(key), :reason, :too_large))
-    state
-  end
 
   defp store(state, key, entry) do
     entries = table(state.name, :entries)

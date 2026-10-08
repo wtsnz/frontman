@@ -167,6 +167,7 @@ request.
 | | |
 | --- | --- |
 | Wait for another request's render | Up to 15 s, then render alone |
+| Waiters per page | 1,000. Past that, requests render through admission. |
 | Background refresh | One per page at a time, without the visitor's `Cookie`, `Authorization` or validators |
 | After a failed refresh | The stale copy stays; the next refresh starts no sooner than 1 s later |
 | Refresh that isn't cacheable, apart from a 5xx or no response | Removes the page |
@@ -290,8 +291,9 @@ Restart reasons are `{:node_exited, reason}`, `{:start_failed, reason}`, `:start
 | `[:frontman, :cache, :evict]` | `count`, `bytes` | |
 | `[:frontman, :cache, :invalidate]` | `count` | `host`, and `path` or `prefix` |
 
-`hit`, `stale`, `miss` and `skip` run in the request process; the rest in the pool's cache
-server. Skip reasons:
+`hit`, `stale` and `miss` run in the request process. `skip` does too, except for
+`:invalidated` and a `:too_large` page whose headers took it past `max_bytes`, which the cache
+server emits along with `store`, `evict` and `invalidate`. Skip reasons:
 
 | Reason | |
 | --- | --- |
@@ -300,7 +302,7 @@ server. Skip reasons:
 | `:method` | A marked response to a method other than GET. |
 | `:status`, `:error` | A status other than 200; `:error` for 5xx. |
 | `:set_cookie`, `:private`, `:vary`, `:encoded` | The response had `Set-Cookie`, `Cache-Control: private` or `no-store`, `Vary` other than `Accept-Encoding`, or `Content-Encoding`. |
-| `:too_large` | The body passed `max_entry_bytes`. |
+| `:too_large` | The body passed `max_entry_bytes`, or body and headers together passed `max_bytes`. |
 | `:aborted` | The response stopped part-way. |
 | `:unavailable` | No response from Node, such as a 503 from admission. |
 | `:invalidated` | An invalidation ran while the page rendered. |
