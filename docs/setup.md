@@ -529,6 +529,30 @@ touches `priv` after the build succeeds. Ignore its output in Git:
 The frontend directory, build command, output and destinations are configurable. See
 [Reference](reference.md#mix-frontmanpackage).
 
+### In a build container
+
+The frontend is now release source. If your build tool hashes source files to decide whether a
+build is current, or to key a build cache, include the frontend directory, without
+`node_modules` and the build's output. Otherwise a change only to the frontend leaves an old build
+looking current.
+
+Keep the frontend's `node_modules` out of the build context. In `.dockerignore`, `node_modules`
+matches only at the root; use `**/node_modules`. `npm ci` deletes a copied one before
+installing, so it only slows the build.
+
+A builder that starts empty each time downloads Node and runs `npm ci` from scratch on every
+build, which is slower and needs nodejs.org and the npm registry to be reachable. To reuse
+downloads, keep `$FRONTMAN_CACHE_DIR` and npm's cache on storage that outlives the build, for
+example with BuildKit cache mounts, which only help if the builder itself is kept between builds:
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.cache/frontman \
+    --mount=type=cache,target=/root/.npm \
+    mix assets.deploy
+```
+
+`node_mirror` can point at an internal mirror of `nodejs.org/dist` instead.
+
 With `PHX_SERVER=true`, the pool starts after the endpoint. The runtime image needs `ps` and
 `kill`, and the shared libraries Node links: glibc, `libstdc++` and `libgcc_s`, which Debian and
 Ubuntu images include. To use a Node installed on the host instead, skip the task and set
