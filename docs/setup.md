@@ -585,6 +585,8 @@ Frontman.start_link(
 Then mark routes with the `cacheable` helper from the [README](../README.md#mark-a-tanstack-start-route).
 Before you mark one, check every loader in its route tree, starting with the root. A root loader
 that reads the session puts the first visitor's account in the cached page. Load the session on
-the client for cacheable routes.
+the client for cacheable routes. To check, run the release locally or in staging with
+`cache: [debug: true]`, sign in, and open each cacheable page. Frontman logs any page that
+renders differently for you than for an anonymous visitor.
 
 A development pool with `port` ignores `cache`, so Vite keeps serving every request.

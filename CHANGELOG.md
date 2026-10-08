@@ -21,3 +21,6 @@ Initial extraction from a Phoenix, Ash and TanStack Start application. Experimen
   keyed on host, path and query string. Concurrent misses render once, with optional
   stale-while-revalidate, ETag and `304` answers, `Frontman.invalidate/2`, size bounds, telemetry
   and counters in `Frontman.status/1`. Pools with `port` ignore it. Off unless configured.
+- Page cache `debug` option: renders marked pages requested with cookies again without them,
+  stores the anonymous copy, and logs pages that differ or that carry the marker but can't be
+  stored.

@@ -6,7 +6,7 @@ defmodule Frontman.CacheTest do
   alias Frontman.Proxy
 
   @pool CachePool
-  @events for event <- [:hit, :miss, :stale, :store, :skip, :evict, :invalidate],
+  @events for event <- [:hit, :miss, :stale, :store, :skip, :evict, :invalidate, :personalised],
               do: [:frontman, :cache, event]
 
   # Reports every render to the test process. Bodies differ per render, so a repeated body
@@ -90,6 +90,18 @@ defmodule Frontman.CacheTest do
     defp respond(%{request_path: "/host"} = conn, _test) do
       host = conn |> get_req_header("x-forwarded-host") |> List.first()
       page(conn, marked(), 200, host)
+    end
+
+    # Greets whoever the cookie says, as a root loader that reads the session would.
+    defp respond(%{request_path: "/whoami"} = conn, _test) do
+      name = conn |> get_req_header("cookie") |> List.first("guest")
+      page(conn, marked(), 200, "<p>Signed in as #{name}</p>")
+    end
+
+    # Cacheable only for visitors with a cookie.
+    defp respond(%{request_path: "/members"} = conn, _test) do
+      marker = if get_req_header(conn, "cookie") == [], do: [], else: marked()
+      page(conn, marker)
     end
 
     defp respond(%{request_path: "/validators"} = conn, _test) do
@@ -643,6 +655,91 @@ defmodule Frontman.CacheTest do
     end
 
     assert %{max_entry_bytes: 100} = Frontman.Cache.config!(max_bytes: 100)
+  end
+
+  describe "debug mode" do
+    @describetag cache: [debug: true]
+
+    test "a page that ignores cookies is stored from an anonymous render" do
+      visitor = get("/page", [{"cookie", "session=alice"}])
+      assert renders("/page") == 1
+      assert_receive {:rendered, "/page", ""}, 1_000
+      stats()
+
+      hit = get("/page")
+      assert header(hit, "x-frontman-cache-status") == "hit"
+      # Same page, rendered a second time: only the per-render number differs.
+      assert hit.resp_body != visitor.resp_body
+      refute_received {:telemetry, :personalised, _, _}
+      assert stats().personalised == 0
+    end
+
+    test "a page that depends on cookies is reported, and only the anonymous copy is stored" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          visitor = get("/whoami", [{"cookie", "alice"}])
+          assert visitor.resp_body == "<p>Signed in as alice</p>"
+          assert_receive {:telemetry, :personalised, _, %{path: "/whoami"}}, 1_000
+          stats()
+        end)
+
+      assert log =~
+               "GET www.example.com/whoami rendered differently without the visitor's cookies"
+
+      assert log =~ "Signed in as alice"
+      assert log =~ "Signed in as guest"
+      assert get("/whoami", [{"cookie", "bob"}]).resp_body == "<p>Signed in as guest</p>"
+      assert stats().personalised == 1
+    end
+
+    test "waiters on the visitor's render get the anonymous copy" do
+      leader = Task.async(fn -> get("/hold", [{"cookie", "session=alice"}]) end)
+      node = held()
+      waiters = for _ <- 1..3, do: Task.async(fn -> get("/hold") end)
+      eventually(fn -> waiting("/hold") end, &(&1 == 3))
+      send(node, :release)
+
+      # The anonymous check is the second render; the waiters keep waiting for it.
+      send(held(), :release)
+      assert Task.await(leader).status == 200
+      bodies = waiters |> Task.await_many() |> Enum.map(& &1.resp_body) |> Enum.uniq()
+      assert [anonymous] = bodies
+      assert header(get("/hold"), "x-frontman-cache-status") == "hit"
+      assert get("/hold").resp_body == anonymous
+    end
+
+    test "a page cacheable only with cookies is not stored" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          get("/members", [{"cookie", "session=alice"}])
+          # Emitted by the anonymous render, after its warning.
+          assert_receive {:telemetry, :skip, _, %{path: "/members", reason: :not_marked}}, 1_000
+          stats()
+        end)
+
+      assert log =~ "without them it couldn't (not_marked)"
+      assert stats().entries == 0
+    end
+
+    test "explains why a marked page wasn't stored" do
+      log = ExUnit.CaptureLog.capture_log(fn -> get("/cookie") end)
+      assert log =~ "GET www.example.com/cookie has the x-frontman-cache marker"
+      assert log =~ "the response sets a cookie"
+      assert ExUnit.CaptureLog.capture_log(fn -> get("/plain") end) == ""
+    end
+  end
+
+  test "without debug mode, nothing is rendered twice or logged" do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        get("/whoami", [{"cookie", "alice"}])
+        get("/cookie")
+      end)
+
+    refute log =~ "Frontman cache"
+    assert renders("/whoami") == 1
+    stats()
+    assert get("/whoami").resp_body == "<p>Signed in as alice</p>"
   end
 
   describe "without a cache" do
