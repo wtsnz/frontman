@@ -81,6 +81,47 @@ restart_attempt, next_delay}`, where `phase` is one of `:starting`, `:ready`, `:
 `:stopping`, `:backoff`, `:cleanup_failed`, or `:external` for an
 [external server](#external-server).
 
+## `mix frontman.package`
+
+Builds the frontend with a pinned Node and copies Node and the build into `priv` for a release.
+See [Setup](setup.md#9-ship-it-in-a-release). Configure it in `config :frontman, :package`.
+Each option except `build` can also be given on the command line, for example
+`--node-version 22.22.2` or `--frontend assets/app`.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `node_version` | required | Exact Node version, such as `"22.22.2"`. |
+| `frontend` | `"frontend"` | Directory with `package.json` and `package-lock.json`. |
+| `build` | `["run", "build"]` | npm arguments that build the frontend. |
+| `output` | `".output"` | The build's output directory, inside `frontend`. |
+| `node_destination` | `"priv/node"` | Where Node goes. The binary is `bin/node` inside it. |
+| `frontend_destination` | `"priv/frontend"` | Where the output directory is copied, keeping its name. |
+| `node_mirror` | `"https://nodejs.org/dist"` | Base URL of Node releases, laid out like `nodejs.org/dist`, or a local directory. |
+
+Paths are relative to the project root and must stay inside it.
+
+Each run:
+
+1. Picks Node's archive for the build machine: `linux-x64`, `linux-arm64`, `darwin-x64` or
+   `darwin-arm64`. Other platforms, including musl Linux, fail.
+2. Uses the cached `node-v<version>-<platform>.tar.gz` and `SHASUMS256.txt` if the archive still
+   matches, otherwise downloads both through Mix's HTTP client, which verifies TLS against the
+   system CA store and honours `HTTPS_PROXY` and `HEX_CACERTS_PATH`. A mismatch fails, and nothing
+   unverified is cached.
+3. Extracts the archive into `_build/<env>/frontman/` and runs `npm ci`, then npm with `build`, in
+   `frontend`. That Node's `bin` comes first on `PATH`, so scripts that call `node`, `npm` or `npx`
+   get the packaged versions.
+4. Deletes `frontend/<output>` before building, and fails if the build doesn't write it again.
+5. Replaces `node_destination` with `bin/node` and Node's `LICENSE`, and
+   `frontend_destination/<output>` with a copy of the build.
+
+The cache is `$FRONTMAN_CACHE_DIR`, or the user cache directory: `~/.cache/frontman` on Linux,
+`~/Library/Caches/frontman` on macOS.
+
+The checksum file comes from the same mirror as the archive, over HTTPS. It catches corrupted or
+altered downloads, and a cached archive that changed on disk, but not a compromised mirror.
+Frontman doesn't check the GPG signature on `SHASUMS256.txt`.
+
 ## Worker protocol
 
 Any HTTP server can be a worker if it does the following.

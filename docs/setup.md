@@ -478,16 +478,62 @@ directly with `server.hmr.clientPort`. While Vite isn't listening, page requests
 
 ## 9. Ship it in a release
 
-The release needs the Start build and a Node binary. One way:
+The release needs the Start build and a Node binary for the platform it runs on.
+`mix frontman.package` builds the frontend and puts both in `priv`:
 
-1. Build the frontend: `npm --prefix frontend ci && npm --prefix frontend run build`.
-2. Copy `frontend/.output` to `priv/frontend/.output`.
-3. Copy a Node binary for the target platform to `priv/node/bin/node`, or install Node in the
-   runtime image and set `NODE_BINARY`.
-4. Build the release as usual. With `PHX_SERVER=true`, the pool starts after the endpoint.
+1. It downloads the official Node archive for the build machine's OS and CPU, and checks it
+   against Node's published `SHASUMS256.txt`.
+2. It runs `npm ci` and `npm run build` in `frontend/` with that Node, so the build machine
+   doesn't need Node installed.
+3. It copies the `node` binary to `priv/node/bin/node` and `frontend/.output` to
+   `priv/frontend/.output`, the paths the production config in step 2 reads.
 
-The runtime image needs `ps` and `kill`, and Node's own shared libraries. Frontman gives each
-worker `SERVER_SHUTDOWN_TIMEOUT=4` (seconds), which Nitro uses to drain connections on SIGTERM.
+Pin the Node version and run the task before `mix release`:
+
+```elixir
+# config/config.exs
+config :frontman, :package, node_version: "22.22.2"
+```
+
+```elixir
+# mix.exs
+defp aliases do
+  [
+    "assets.deploy": ["frontman.package"]
+  ]
+end
+```
+
+```sh
+MIX_ENV=prod mix assets.deploy
+MIX_ENV=prod mix release
+```
+
+If you already have an `assets.deploy` alias, for example for Phoenix's esbuild and tailwind,
+add `"frontman.package"` to its list.
+
+Run it on the platform the release targets, such as the Linux container that builds your release.
+Node is downloaded for the machine the task runs on, and `npm ci` installs native packages for
+it. Only the `node` binary and Node's license ship; npm stays behind. Verified downloads are cached
+in `~/.cache/frontman` (`~/Library/Caches/frontman` on macOS), or `$FRONTMAN_CACHE_DIR`.
+
+The task fails on a checksum mismatch, an unsupported platform (it supports Linux and macOS,
+x64 and arm64, with glibc), a failed npm command, or a build that writes no `.output`. It only
+touches `priv` after the build succeeds. Ignore its output in Git:
+
+```gitignore
+/priv/node/
+/priv/frontend/
+```
+
+The frontend directory, build command, output and destinations are configurable. See
+[Reference](reference.md#mix-frontmanpackage).
+
+With `PHX_SERVER=true`, the pool starts after the endpoint. The runtime image needs `ps` and
+`kill`, and the shared libraries Node links: glibc, `libstdc++` and `libgcc_s`, which Debian and
+Ubuntu images include. To use a Node installed on the host instead, skip the task and set
+`NODE_BINARY`. Frontman gives each worker `SERVER_SHUTDOWN_TIMEOUT=4` (seconds), which Nitro uses
+to drain connections on SIGTERM.
 
 Read [Operations](operations.md) before your first deploy. It covers draining the pool during a
 cutover and the telemetry worth alerting on.

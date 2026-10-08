@@ -71,9 +71,11 @@ containers is still the better choice.
   `X-Forwarded-*` headers intact.
 - Caps concurrent requests per worker and answers `503` with `Retry-After: 2` when full.
 - Drains and resumes the pool for deploys, and emits telemetry and OpenTelemetry spans.
+- Packages a release: `mix frontman.package` builds the frontend with a pinned,
+  checksum-verified Node and copies Node and the build into `priv`.
 
-It doesn't build your frontend, bundle Node, generate the Ash TypeScript client, or configure
-deployment. Your application owns those.
+It doesn't generate the Ash TypeScript client or configure deployment. Your application owns
+those.
 
 ## Install
 
@@ -130,7 +132,23 @@ export default createServerEntry({
 });
 ```
 
-These snippets assume an existing Node server build. [docs/setup.md](docs/setup.md) covers the
+To ship Node and the build in your release, pin a Node version and run `mix frontman.package`
+before `mix release`, for example as your `assets.deploy` alias:
+
+```elixir
+# config/config.exs
+config :frontman, :package, node_version: "22.22.2"
+
+# mix.exs, in aliases/0
+"assets.deploy": ["frontman.package"]
+```
+
+It downloads Node for the build machine, verifies it against Node's published SHA-256, runs
+`npm ci` and `npm run build` in `frontend/` with it, and copies `node` to `priv/node/bin/node`
+and `.output` to `priv/frontend/.output`. Run it where the release is built, on the target
+platform.
+
+These snippets assume a Nitro Node server build. [docs/setup.md](docs/setup.md) covers the
 Nitro build configuration, the trusted public origin, static assets, both loader transports,
 health checks, development and releases.
 

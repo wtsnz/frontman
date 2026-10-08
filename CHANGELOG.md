@@ -14,3 +14,6 @@ Initial extraction from a Phoenix, Ash and TanStack Start application. Experimen
 - Context and results for the catalogue's deployed navigation CPU measurement.
 - `port` pool option: proxy to a server Frontman doesn't run, such as the Vite dev server.
 - The proxy sets `X-Forwarded-Host` from the `Host` header, keeping a non-default port.
+- `mix frontman.package`: builds the frontend with a pinned Node, verified against Node's published
+  SHA-256 and cached between runs, and copies the `node` binary and the build into `priv` for the
+  release. Configured through `config :frontman, :package`.
